@@ -1,0 +1,307 @@
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: aegis-postgres
+    restart: on-failure
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aegis}
+      POSTGRES_DB: aegis
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Orchestrator ──────────────────────────────────────────────────────────
+  # Owns the inbound stream consumer group and bootstraps all queue streams.
+  # Build context is ./orchestrator (no shared files needed).
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: aegis-orchestrator
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      BLOCK_MS: ${BLOCK_MS:-5000}
+
+  # ── NVD Ingestion Agent ───────────────────────────────────────────────────
+  # Build context is the repo root so orchestrator/schema.py can be copied in.
+  ingestion:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    container_name: aegis-ingestion
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started   # orchestrator bootstraps the inbound stream
+    environment:
+      REDIS_URL: redis://redis:6379
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ── Triage Agent ──────────────────────────────────────────────────────────
+  # Build context is the repo root so orchestrator/schema.py can be copied in.
+  triage:
+    build:
+      context: .
+      dockerfile: triage/Dockerfile
+    container_name: aegis-triage
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started   # orchestrator bootstraps aegis:queue:triage
+      neo4j:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      TRIAGE_THRESHOLD: ${TRIAGE_THRESHOLD:-0.4}
+      TRIAGE_CONSUMER_NAME: ${TRIAGE_CONSUMER_NAME:-triage-agent-0}
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ── MITRE ATT&CK Loader ──────────────────────────────────────────────────
+  # One-shot: downloads the Enterprise ATT&CK STIX bundle and loads it into
+  # Neo4j. restart:no ensures it runs once then exits cleanly.
+  # Trigger manually:  docker compose run --rm mitre-loader
+  mitre-loader:
+    build:
+      context: ./neo4j
+      dockerfile: Dockerfile
+    container_name: aegis-mitre-loader
+    restart: "no"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+    entrypoint: ["python", "mitre_loader.py"]
+
+  # ── Neo4j ────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.19-community
+    container_name: aegis-neo4j
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_security_procedures_allowlist: apoc.*
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Simulation Agent ─────────────────────────────────────────────────────
+  # Consumes aegis:queue:simulation, runs Monte Carlo via Celery workers,
+  # calls Claude for strategy + interpretation, writes to aegis:queue:detection.
+  simulation-agent:
+    build:
+      context: .
+      dockerfile: simulation/Dockerfile
+    container_name: aegis-simulation-agent
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      SIM_THRESHOLD: ${SIM_THRESHOLD:-0.55}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    entrypoint: ["python", "simulation/agent.py"]
+
+  # ── Simulation Workers ────────────────────────────────────────────────────
+  # CPU-bound Celery workers that execute the Monte Carlo tasks.
+  # Scale with: docker compose up --scale simulation-worker=N
+  simulation-worker:
+    build:
+      context: .
+      dockerfile: simulation/Dockerfile
+    container_name: aegis-simulation-worker
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    working_dir: /app/simulation
+    entrypoint:
+      - celery
+      - -A
+      - simulation
+      - worker
+      - --concurrency=${CELERY_CONCURRENCY:-4}
+      - --loglevel=${LOG_LEVEL:-info}
+
+  # ── Graph Schema Init ─────────────────────────────────────────────────────
+  # Runs once on first deploy (or on explicit `docker compose run neo4j-init`).
+  # restart: no ensures it doesn't loop after a clean exit.
+  neo4j-init:
+    build:
+      context: ./neo4j
+      dockerfile: Dockerfile
+    container_name: aegis-neo4j-init
+    restart: "no"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+
+  # ── Detection Agent ──────────────────────────────────────────────────────
+  # Consumes aegis:queue:detection, generates Sigma rules via Claude,
+  # forwards enriched advisories to aegis:queue:advisory.
+  detection:
+    build:
+      context: .
+      dockerfile: detection/Dockerfile
+    container_name: aegis-detection
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DETECTION_SKIP_LOW: ${DETECTION_SKIP_LOW:-false}
+      DETECTION_CONSUMER_NAME: ${DETECTION_CONSUMER_NAME:-detection-agent-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ── Advisory Agent ───────────────────────────────────────────────────────
+  # Final pipeline stage: consumes aegis:queue:advisory, calls Claude to
+  # produce an executive advisory card, persists to PostgreSQL, and
+  # publishes to aegis:broadcast for the WebSocket bridge.
+  advisory:
+    build:
+      context: .
+      dockerfile: advisory/Dockerfile
+    container_name: aegis-advisory
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DATABASE_URL: postgresql://aegis:${POSTGRES_PASSWORD:-aegis}@postgres:5432/aegis
+      ADVISORY_CONSUMER_NAME: ${ADVISORY_CONSUMER_NAME:-advisory-agent-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ── WebSocket Bridge ──────────────────────────────────────────────────────
+  # Subscribes to aegis:broadcast Redis pub/sub and pushes advisory JSON
+  # to all connected dashboard WebSocket clients.
+  bridge:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    container_name: aegis-bridge
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${BRIDGE_PORT:-8765}:8765"
+    environment:
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # ── React UI ─────────────────────────────────────────────────────────────
+  # Production build served by nginx.  Proxies /ws → bridge, /api → frontend.
+  aegis-ui:
+    build:
+      context: ./aegis-ui
+      dockerfile: Dockerfile
+    container_name: aegis-ui
+    restart: on-failure
+    depends_on:
+      - bridge
+      - frontend
+    ports:
+      - "${UI_PORT:-3000}:80"
+
+  # ── Legacy Dashboard (FastAPI + SSE) ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aegis-frontend
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    environment:
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+volumes:
+  redis-data:
+  neo4j-data:
+  neo4j-logs:
+  postgres-data:

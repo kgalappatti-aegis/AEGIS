@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AEGIS – Security Operations</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- ── Header ──────────────────────────────────────────────────────── -->
+  <header>
+    <div class="header-left">
+      <span class="logo">AEGIS</span>
+      <span class="logo-sub">Security Operations</span>
+    </div>
+    <div class="header-right">
+      <span class="status-dot" id="status-dot"></span>
+      <span class="status-label" id="status-label">Connecting…</span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ── Stat Cards ───────────────────────────────────────────────── -->
+    <section class="stats-row">
+      <div class="stat-card">
+        <div class="stat-label">Events Ingested</div>
+        <div class="stat-value" id="stat-total">—</div>
+        <div class="stat-sub">all time</div>
+      </div>
+      <div class="stat-card priority-p0">
+        <div class="stat-label">Critical / High</div>
+        <div class="stat-value" id="stat-high">—</div>
+        <div class="stat-sub">P0 + P1</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Triaged</div>
+        <div class="stat-value" id="stat-triaged">—</div>
+        <div class="stat-sub">scored events</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Avg Relevance</div>
+        <div class="stat-value" id="stat-relevance">—</div>
+        <div class="stat-sub">triaged events</div>
+      </div>
+    </section>
+
+    <!-- ── Queue Depths ─────────────────────────────────────────────── -->
+    <section class="queue-bar">
+      <span class="queue-label">Live Queue Depths</span>
+      <div class="queue-pills">
+        <span class="pill pill-triage">Triage <b id="q-triage">—</b></span>
+        <span class="pill pill-simulation">Simulation <b id="q-simulation">—</b></span>
+        <span class="pill pill-advisory">Advisory <b id="q-advisory">—</b></span>
+      </div>
+    </section>
+
+    <!-- ── Main Grid ────────────────────────────────────────────────── -->
+    <section class="content-grid">
+
+      <!-- Live Event Feed -->
+      <div class="panel" id="feed-panel">
+        <div class="panel-header">
+          <span class="panel-title">Live Event Feed</span>
+          <span class="live-badge">● LIVE</span>
+        </div>
+        <div class="feed" id="event-feed">
+          <div class="feed-empty">Waiting for events…</div>
+        </div>
+      </div>
+
+      <!-- Charts -->
+      <div class="charts-col">
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Priority Distribution</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="priority-chart"></canvas>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Routing Targets</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="routing-chart"></canvas>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ── Triage Results Table ─────────────────────────────────────── -->
+    <section class="panel triage-panel">
+      <div class="panel-header">
+        <span class="panel-title">Recent Triage Results</span>
+        <span class="panel-sub">Latest 50 scored events</span>
+      </div>
+      <div class="table-wrap">
+        <table id="triage-table">
+          <thead>
+            <tr>
+              <th>CVE / Event ID</th>
+              <th>Source</th>
+              <th>Priority</th>
+              <th>Relevance</th>
+              <th>Infra Match</th>
+              <th>Exploitability</th>
+              <th>Temporal Urgency</th>
+              <th>Routed To</th>
+              <th>Ingested</th>
+            </tr>
+          </thead>
+          <tbody id="triage-tbody">
+            <tr><td colspan="9" class="table-empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

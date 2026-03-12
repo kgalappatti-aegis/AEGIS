@@ -1,0 +1,38 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 14px; }
+
+body {
+  background: #0a0e1a;
+  color: #cdd9ec;
+  font-family: 'IBM Plex Mono', Consolas, monospace;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: #1e2d45; border-radius: 3px; }
+
+/* ── Animations ─────────────────────────────────────────────────────────── */
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes flashRow {
+  0%   { background: rgba(0, 212, 170, 0.12); }
+  100% { background: transparent; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.row-new  { animation: slideIn 0.22s ease-out, flashRow 0.7s ease-out; }
+.card-new { animation: slideIn 0.28s ease-out; }
+
+/* ── Button reset ───────────────────────────────────────────────────────── */
+button { font-family: inherit; cursor: pointer; }

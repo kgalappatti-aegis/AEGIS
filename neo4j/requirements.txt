@@ -1,0 +1,5 @@
+httpx>=0.27.0
+neo4j>=5.19.0
+python-dotenv>=1.0.0
+redis>=5.0.0
+stix2>=3.0.0
