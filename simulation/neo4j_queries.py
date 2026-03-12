@@ -330,29 +330,43 @@ def sync_get_attack_paths(
                     cve_id,
                 )
 
-        # Attach PRECEDES transition probabilities for each path
+        # Attach PRECEDES transition probabilities for each path.
+        # Batch all transition pairs into a single Cypher call to avoid
+        # N round-trips per path (the main source of timeout errors).
+        all_pairs: list[dict[str, str]] = []
         for path in all_paths:
             steps: list[str] = path.get("steps") or []
-            transitions: list[dict] = []
-
             for i in range(len(steps) - 1):
-                t_result = session.run(
-                    """
-                    MATCH (a:TTP {mitre_id: $from_id})-[r:PRECEDES]->(b:TTP {mitre_id: $to_id})
-                    RETURN r.transition_probability AS prob
-                    """,
-                    from_id=steps[i],
-                    to_id=steps[i + 1],
-                )
-                row = t_result.single()
-                # Default to 0.5 when no explicit PRECEDES edge exists
-                prob = row["prob"] if row and row["prob"] is not None else 0.5
+                all_pairs.append({"from_id": steps[i], "to_id": steps[i + 1]})
+
+        prob_lookup: dict[tuple[str, str], float] = {}
+        if all_pairs:
+            prob_result = session.run(
+                """
+                UNWIND $pairs AS pair
+                OPTIONAL MATCH (a:TTP {mitre_id: pair.from_id})
+                               -[r:PRECEDES]->
+                               (b:TTP {mitre_id: pair.to_id})
+                RETURN pair.from_id AS from_id,
+                       pair.to_id   AS to_id,
+                       r.transition_probability AS prob
+                """,
+                pairs=all_pairs,
+            )
+            for row in prob_result:
+                p = row["prob"] if row["prob"] is not None else 0.5
+                prob_lookup[(row["from_id"], row["to_id"])] = float(p)
+
+        for path in all_paths:
+            steps = path.get("steps") or []
+            transitions: list[dict] = []
+            for i in range(len(steps) - 1):
+                prob = prob_lookup.get((steps[i], steps[i + 1]), 0.5)
                 transitions.append({
                     "from_id": steps[i],
                     "to_id":   steps[i + 1],
                     "prob":    prob,
                 })
-
             path["transitions"] = transitions
 
         return all_paths

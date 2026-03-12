@@ -70,6 +70,9 @@ def _get_driver() -> GraphDatabase:
         _neo4j_driver = GraphDatabase.driver(
             settings.neo4j_url,
             auth=(settings.neo4j_user, settings.neo4j_password),
+            connection_timeout=10,
+            max_connection_lifetime=300,
+            connection_acquisition_timeout=30,
         )
     return _neo4j_driver
 

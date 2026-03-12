@@ -270,7 +270,7 @@ async def run_simulation(state: SimulationState) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     results_list: list[Any] = await loop.run_in_executor(
         None,
-        lambda: async_result.get(timeout=300, propagate=False),
+        lambda: async_result.get(timeout=330, propagate=False),
     )
 
     simulation_results: dict[str, dict] = {}
