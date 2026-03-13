@@ -71,7 +71,7 @@ def build_graph(
     node signature is ``(state) -> dict``.
     """
     _generate  = functools.partial(generate_advisory, client=anthropic_client)
-    _persist   = functools.partial(persist,           pool=db_pool)
+    _persist   = functools.partial(persist,           pool=db_pool, redis=redis_client)
     _broadcast = functools.partial(broadcast,         redis=redis_client)
     _ack       = functools.partial(acknowledge,       redis=redis_client)
 

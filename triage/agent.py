@@ -3,22 +3,23 @@ AEGIS Triage Agent
 
 Consumer loop topology
 ----------------------
-                    ┌─────────────────────────────────────────────────────┐
-                    │  aegis:queue:triage  (XREADGROUP / XAUTOCLAIM)       │
-                    └──────────────────────┬──────────────────────────────┘
-                                           │
+                    +-----------------------------------------------------+
+                    |  aegis:queue:triage  (XREADGROUP / XAUTOCLAIM)       |
+                    +----------------------+------------------------------+
+                                           |
                                     parse AEGISEvent
+                                    enrich (EPSS + KEV + CIRCL)
                                     compute TriageScores
                                     enrich + re-validate
-                                           │
-                         ┌─────────────────┴─────────────────┐
-                  score ≥ threshold                   score < threshold
-                         │                                    │
-                  routing_target=simulation          priority  → P3
-                         │                          routing_target=advisory
-                         ▼                                    ▼
+                                           |
+                         +-----------------+-----------------+
+                  score >= threshold                  score < threshold
+                         |                                    |
+                  routing_target=simulation          priority  -> P3
+                         |                          routing_target=advisory
+                         v                                    v
                aegis:queue:simulation              aegis:queue:advisory
-                                           │
+                                           |
                               XACK  aegis:queue:triage
 
 Guarantees
@@ -41,6 +42,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import redis.asyncio as aioredis
 from neo4j import AsyncGraphDatabase
 
@@ -65,6 +67,7 @@ from config import (  # noqa: E402
     TRIAGE_QUEUE_KEY,
     settings,
 )
+from enrichment import EnrichmentData, enrich_event  # noqa: E402
 from scorer import TriageScores, compute_scores  # noqa: E402
 
 
@@ -79,6 +82,10 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("aegis.triage.agent")
+
+# Priority ranking: lower index = more severe
+_PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+_RANK_PRIORITY = {v: k for k, v in _PRIORITY_RANK.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -121,19 +128,38 @@ def _decode_fields(
 
 
 # ---------------------------------------------------------------------------
+# KEV priority bump
+# ---------------------------------------------------------------------------
+
+def _kev_priority_bump(priority: str) -> str:
+    """Bump priority up one tier when CVE is in CISA KEV."""
+    rank = _PRIORITY_RANK.get(priority, 3)
+    bumped = max(0, rank - 1)  # P3→P2, P2→P1, P1→P0, P0→P0
+    return _RANK_PRIORITY.get(bumped, "P0")
+
+
+# ---------------------------------------------------------------------------
 # Core triage logic  (pure – no Redis I/O, easy to unit-test)
 # ---------------------------------------------------------------------------
 
-def apply_triage(event: AEGISEvent, scores: TriageScores, threshold: float) -> AEGISEvent:
+def apply_triage(
+    event: AEGISEvent,
+    scores: TriageScores,
+    threshold: float,
+    enrichment: EnrichmentData | None = None,
+) -> AEGISEvent:
     """
     Merge triage scores into *event* and set the downstream routing.
 
     Rules
     -----
-    relevance_score ≥ threshold  →  routing_target = "simulation"
-                                     priority unchanged
-    relevance_score < threshold  →  routing_target = "advisory"
-                                     priority downgraded to "P3"
+    relevance_score >= threshold  ->  routing_target = "simulation"
+                                       priority unchanged
+    relevance_score < threshold   ->  routing_target = "advisory"
+                                       priority downgraded to "P3"
+
+    KEV override: if the CVE is in CISA KEV, bump priority up one tier
+    regardless of routing decision.
 
     Returns a new, fully-validated AEGISEvent instance (model_validate
     re-runs all validators, including triage_fields_all_or_none).
@@ -143,6 +169,18 @@ def apply_triage(event: AEGISEvent, scores: TriageScores, threshold: float) -> A
     new_priority       = event.priority      if high_relevance else "P3"
     new_routing_target = "simulation"        if high_relevance else "advisory"
     new_dispatch_key   = SIMULATION_QUEUE_KEY if high_relevance else ADVISORY_QUEUE_KEY
+
+    # KEV hit → bump priority up a tier
+    if enrichment and enrichment.in_kev:
+        new_priority = _kev_priority_bump(new_priority)
+        logger.info(
+            "KEV priority bump for %s: %s → %s (added %s, ransomware=%s)",
+            event.event_id,
+            event.priority,
+            new_priority,
+            enrichment.kev_date_added or "?",
+            enrichment.kev_ransomware or "?",
+        )
 
     data = event.model_dump(mode="python")
     data.update(
@@ -170,17 +208,15 @@ async def _process_message(
     fields: dict[bytes | str, bytes | str],
     threshold: float,
     neo4j_driver: Any | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> None:
     """
     Full triage pipeline for one stream message:
-      decode → parse → score → enrich → forward → ACK
+      decode -> parse -> enrich (EPSS+KEV+CIRCL) -> score -> route -> ACK
     """
     decoded = _decode_fields(fields)
 
     # --- 1. Guard: skip non-event messages --------------------------------
-    # Stream bootstrapping used to write {"type": "sentinel", "init": "true"}
-    # entries; existing deployments may still have them.  Any message that
-    # lacks source_type cannot be a valid AEGISEvent — ACK and discard.
     if "source_type" not in decoded:
         logger.debug("Skipping non-event message %s: %s", msg_id, decoded)
         await redis.xack(TRIAGE_QUEUE_KEY, CONSUMER_GROUP, msg_id)
@@ -195,12 +231,29 @@ async def _process_message(
         await redis.xack(TRIAGE_QUEUE_KEY, CONSUMER_GROUP, msg_id)
         return
 
-    # --- 2. Score --------------------------------------------------------
-    scores = await compute_scores(event.raw_payload, neo4j_driver=neo4j_driver)
+    # --- 3. External enrichment (EPSS + KEV + CIRCL + ThreatFox + MalwareBazaar + OSV)
+    raw_payload = event.raw_payload or {}
+    cve_id = raw_payload.get("cve_id")
+    enrichment = EnrichmentData()
+    if http_client:
+        try:
+            enrichment = await enrich_event(
+                http_client, cve_id, raw_payload, event.source_type,
+                abusech_auth_key=settings.abusech_auth_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Enrichment failed for %s: %s — using defaults.", cve_id, exc)
 
-    # --- 3. Enrich + route -----------------------------------------------
+    # --- 4. Score --------------------------------------------------------
+    scores = await compute_scores(
+        event.raw_payload,
+        neo4j_driver=neo4j_driver,
+        enrichment=enrichment,
+    )
+
+    # --- 5. Enrich + route -----------------------------------------------
     try:
-        enriched, dest_key = apply_triage(event, scores, threshold)
+        enriched, dest_key = apply_triage(event, scores, threshold, enrichment)
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "Triage enrichment failed for event %s: %s", event.event_id, exc
@@ -208,20 +261,25 @@ async def _process_message(
         await redis.xack(TRIAGE_QUEUE_KEY, CONSUMER_GROUP, msg_id)
         return
 
-    # --- 4. Forward ------------------------------------------------------
+    # --- 6. Forward ------------------------------------------------------
     stream_data = enriched.to_redis_stream()
     await redis.xadd(dest_key, stream_data, maxlen=50_000, approximate=True)
 
+    epss_str = f"EPSS={enrichment.epss_score:.4f}" if enrichment.epss_score is not None else "EPSS=n/a"
+    kev_str = "KEV=YES" if enrichment.in_kev else "KEV=no"
+
     logger.info(
-        "Triaged event %s (src=%s, priority=%s): %s → %s",
+        "Triaged event %s (src=%s, priority=%s, %s, %s): %s -> %s",
         enriched.event_id,
         enriched.source_type,
         enriched.priority,
+        epss_str,
+        kev_str,
         scores,
         dest_key,
     )
 
-    # --- 5. ACK (only after successful forward) --------------------------
+    # --- 7. ACK (only after successful forward) --------------------------
     await redis.xack(TRIAGE_QUEUE_KEY, CONSUMER_GROUP, msg_id)
 
 
@@ -233,17 +291,19 @@ async def consume(
     redis: aioredis.Redis,
     shutdown: asyncio.Event,
     neo4j_driver: Any | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> None:
     threshold     = settings.triage_threshold
     consumer_name = settings.consumer_name
 
     logger.info(
         "Triage Agent started. Queue: '%s', group: '%s', consumer: '%s'. "
-        "Threshold: %.2f.",
+        "Threshold: %.2f. Enrichment: %s.",
         TRIAGE_QUEUE_KEY,
         CONSUMER_GROUP,
         consumer_name,
         threshold,
+        "enabled" if http_client else "disabled",
     )
 
     while not shutdown.is_set():
@@ -288,7 +348,10 @@ async def consume(
         for raw_id, raw_fields in all_messages:
             msg_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
             try:
-                await _process_message(redis, msg_id, raw_fields, threshold, neo4j_driver)
+                await _process_message(
+                    redis, msg_id, raw_fields, threshold,
+                    neo4j_driver, http_client,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Unhandled error processing message %s: %s", msg_id, exc
@@ -325,6 +388,12 @@ async def main() -> None:
             )
             neo4j_driver = None
 
+    # httpx client for external enrichment (EPSS, KEV, CIRCL)
+    http_client = httpx.AsyncClient(
+        headers={"User-Agent": "AEGIS-Triage/1.0"},
+        follow_redirects=True,
+    )
+
     shutdown = asyncio.Event()
 
     def _handle_signal(sig: signal.Signals) -> None:
@@ -337,8 +406,9 @@ async def main() -> None:
 
     try:
         await bootstrap(redis)
-        await consume(redis, shutdown, neo4j_driver)
+        await consume(redis, shutdown, neo4j_driver, http_client)
     finally:
+        await http_client.aclose()
         if neo4j_driver is not None:
             await neo4j_driver.close()
         await redis.aclose()

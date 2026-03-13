@@ -9,9 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ── Stream / channel names ──────────────────────────────────────────────────
 
-ADVISORY_QUEUE  = "aegis:queue:advisory"
+ADVISORY_QUEUE    = "aegis:queue:advisory"
+ADVISORY_STREAM   = "aegis:stream:advisories"   # persistent stream for UI catchup
 BROADCAST_CHANNEL = "aegis:broadcast"
-CONSUMER_GROUP  = "orchestrator-group"
+CONSUMER_GROUP    = "orchestrator-group"
 
 # ── DB schema ───────────────────────────────────────────────────────────────
 
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS advisories (
     mitre_techniques   JSONB,
     source_type        TEXT,
     ext_references     JSONB,
+    finding_json       JSONB,
     simulated_at       TIMESTAMPTZ,
     detected_at        TIMESTAMPTZ,
     created_at         TIMESTAMPTZ DEFAULT now()
@@ -46,6 +48,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS advisories_event_id_unique ON advisories (even
 CREATE INDEX IF NOT EXISTS advisories_cve_id_idx  ON advisories (cve_id);
 CREATE INDEX IF NOT EXISTS advisories_created_idx ON advisories (created_at DESC);
 CREATE INDEX IF NOT EXISTS advisories_priority_idx ON advisories (priority);
+
+ALTER TABLE advisories ADD COLUMN IF NOT EXISTS finding_json JSONB;
 """
 
 

@@ -160,14 +160,27 @@ export default function AttackMatrix({ wsRef }) {
     return () => ws.removeEventListener('message', handleWsMessage);
   }, [wsRef, handleWsMessage]);
 
-  // Derive display data
+  // Derive display data — merge API techniques with static KNOWN_TECHNIQUES
   const techniques = data?.techniques || {};
   const maxHits = Object.values(techniques).reduce((m, t) => Math.max(m, t.hits || 0), 1);
 
+  // Build full technique list: start with static, add any from API that aren't already known
+  const knownIds = new Set(KNOWN_TECHNIQUES.map(t => t.id));
+  const dynamicTechs = Object.entries(techniques)
+    .filter(([id]) => !knownIds.has(id) && techniques[id]?.tactic)
+    .map(([id, t]) => ({ id, name: t.name || id, tactic: t.tactic }));
+  const allTechniques = [...KNOWN_TECHNIQUES, ...dynamicTechs];
+
+  // Collect unique actors from API data for the actor dropdown
+  const apiActors = new Set();
+  for (const t of Object.values(techniques)) {
+    for (const a of (t.actors || [])) apiActors.add(a);
+  }
+
   // Filter by actor
   const filteredTechs = actor === 'All'
-    ? KNOWN_TECHNIQUES
-    : KNOWN_TECHNIQUES.filter(t => {
+    ? allTechniques
+    : allTechniques.filter(t => {
         const entry = techniques[t.id];
         return entry?.actors?.includes(actor);
       });
@@ -187,7 +200,7 @@ export default function AttackMatrix({ wsRef }) {
   ))).size;
 
   const selectedTech = selected
-    ? { ...KNOWN_TECHNIQUES.find(t => t.id === selected), ...(techniques[selected] || {}) }
+    ? { ...(allTechniques.find(t => t.id === selected) || { id: selected }), ...(techniques[selected] || {}) }
     : null;
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -219,7 +232,7 @@ export default function AttackMatrix({ wsRef }) {
               outline: 'none',
             }}
           >
-            {ACTORS.map(a => <option key={a} value={a}>{a}</option>)}
+            {['All', ...Array.from(apiActors).sort()].map(a => <option key={a} value={a}>{a}</option>)}
           </select>
         </div>
 

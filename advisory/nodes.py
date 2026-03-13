@@ -33,6 +33,7 @@ for _p in (_ORCH, _ADV):
 
 from config import (   # noqa: E402
     ADVISORY_QUEUE,
+    ADVISORY_STREAM,
     BROADCAST_CHANNEL,
     CONSUMER_GROUP,
     settings,
@@ -290,15 +291,30 @@ async def persist(
     state: AdvisoryState,
     *,
     pool: asyncpg.Pool,
+    redis: aioredis.Redis,
 ) -> dict[str, Any]:
     """
     Write the advisory to the PostgreSQL ``advisories`` table.
+
+    Also fetches the simulation finding from Redis and persists it in
+    the ``finding_json`` column so the kill chain survives the 24h TTL.
 
     Uses INSERT … ON CONFLICT (event_id) DO UPDATE so re-processed
     messages overwrite rather than duplicate.
     """
     if state.get("skip"):
         return {"advisory_id": None, "persist_error": None}
+
+    # Fetch simulation finding from Redis before it expires
+    event_id = state.get("event_id", "")
+    finding_json: str | None = None
+    if event_id:
+        try:
+            raw = await redis.get(f"aegis:sim:findings:{event_id}")
+            if raw:
+                finding_json = raw.decode() if isinstance(raw, bytes) else raw
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch finding for %s: %s", event_id, exc)
 
     sql = """
         INSERT INTO advisories (
@@ -308,6 +324,7 @@ async def persist(
             sigma_rules, coverage_gaps,
             tlp, confidence, mitre_techniques,
             source_type, ext_references,
+            finding_json,
             simulated_at, detected_at
         ) VALUES (
             $1,  $2,  $3,  $4,  $5,  $6,
@@ -316,7 +333,8 @@ async def persist(
             $13, $14,
             $15, $16, $17,
             $18, $19,
-            $20, $21
+            $20,
+            $21, $22
         )
         ON CONFLICT (event_id) DO UPDATE SET
             risk_score        = EXCLUDED.risk_score,
@@ -332,6 +350,7 @@ async def persist(
             confidence        = EXCLUDED.confidence,
             mitre_techniques  = EXCLUDED.mitre_techniques,
             ext_references    = EXCLUDED.ext_references,
+            finding_json      = EXCLUDED.finding_json,
             detected_at       = EXCLUDED.detected_at
         RETURNING id::text
     """
@@ -365,8 +384,9 @@ async def persist(
                 _jb(state.get("mitre_techniques", [])), # $17
                 state.get("source_type", ""),          # $18
                 _jb(state.get("ext_references",    [])), # $19
-                _ts_or_none(state.get("simulated_at")), # $20
-                _ts_or_none(state.get("detected_at")),  # $21
+                finding_json,                            # $20
+                _ts_or_none(state.get("simulated_at")), # $21
+                _ts_or_none(state.get("detected_at")),  # $22
             )
 
         advisory_id = row["id"] if row else None
@@ -424,9 +444,19 @@ async def broadcast(
     })
 
     try:
+        # Pub/sub for live clients
         receivers = await redis.publish(BROADCAST_CHANNEL, payload)
+
+        # Persistent stream for UI catchup on reconnect
+        await redis.xadd(
+            ADVISORY_STREAM,
+            {"data": payload},
+            maxlen=500,
+            approximate=True,
+        )
+
         logger.info(
-            "Broadcast advisory for %s to %d receiver(s).",
+            "Broadcast advisory for %s to %d receiver(s) + stream.",
             state.get("event_id"), receivers,
         )
         return {"broadcast_ok": True}

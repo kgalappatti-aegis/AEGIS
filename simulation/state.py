@@ -57,9 +57,14 @@ class SimulationState(TypedDict, total=False):
     severity:               str
     summary:                str
 
+    # ── After load_event (entry TTP heuristic) ───────────────────────────
+    entry_ttp:      str                    # selected initial-access TTP ID
+
     # ── After build_finding_paths ───────────────────────────────────────
     finding_paths:  list[dict[str, Any]]   # structured path data for frontend
     synthetic_path: bool                   # True if Neo4j returned no paths
+    actor_name:     Optional[str]          # top threat actor from Neo4j
+    rotation_map:   dict[str, list[str]]   # detected TTP → substitute TTP IDs
 
     # ── After forward_to_detection ────────────────────────────────────────
     forwarded:     bool

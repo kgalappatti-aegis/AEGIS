@@ -70,6 +70,11 @@ class TriageSettings:
     log_level: str = field(
         default_factory=lambda: os.getenv("LOG_LEVEL", "INFO")
     )
+    # abuse.ch Auth-Key (free from https://auth.abuse.ch/)
+    # Enables ThreatFox IOC + MalwareBazaar hash lookups
+    abusech_auth_key: str = field(
+        default_factory=lambda: os.getenv("ABUSECH_AUTH_KEY", "")
+    )
 
 
 settings = TriageSettings()

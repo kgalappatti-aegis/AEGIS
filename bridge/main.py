@@ -30,6 +30,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import asyncpg
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -43,8 +44,16 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
+DATABASE_URL      = os.getenv("DATABASE_URL", "postgresql://aegis:aegis@localhost:5432/aegis")
+INBOUND_STREAM    = "aegis:events:inbound"
 DETECTION_QUEUE   = "aegis:queue:detection"
+TRIAGE_QUEUE      = "aegis:queue:triage"
+SIMULATION_QUEUE  = "aegis:queue:simulation"
+ADVISORY_QUEUE    = "aegis:queue:advisory"
+ADVISORY_STREAM   = "aegis:stream:advisories"
 BROADCAST_CHANNEL = "aegis:broadcast"
+CATCHUP_LIMIT     = int(os.getenv("STATS_SAMPLE", "200"))
+STATS_INTERVAL_S  = 10
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO")
 
 logging.basicConfig(
@@ -258,6 +267,80 @@ async def _subscribe_loop(redis: aioredis.Redis) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Task 3: periodic stats broadcast
+# ---------------------------------------------------------------------------
+
+async def _stats_loop(redis: aioredis.Redis) -> None:
+    """
+    Every STATS_INTERVAL_S seconds, compute pipeline stats from Redis
+    and broadcast a type:"stats" message to all WebSocket clients.
+    """
+    logger.info("Stats loop started (interval=%ds).", STATS_INTERVAL_S)
+    try:
+        while True:
+            await asyncio.sleep(STATS_INTERVAL_S)
+            if not manager.count:
+                continue
+
+            try:
+                total_ingested = await redis.xlen(INBOUND_STREAM)
+
+                triage_depth = await redis.xlen(TRIAGE_QUEUE)
+                sim_depth    = await redis.xlen(SIMULATION_QUEUE)
+                adv_depth    = await redis.xlen(ADVISORY_QUEUE)
+
+                # Sample recent inbound events for priority distribution
+                by_priority = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
+                relevance_scores = []
+
+                sample = await redis.xrevrange(INBOUND_STREAM, count=2000)
+                for _raw_id, fields in (sample or []):
+                    f = _decode(fields)
+                    p = f.get("priority")
+                    if p in by_priority:
+                        by_priority[p] += 1
+
+                # Relevance scores from triaged events
+                for queue in (SIMULATION_QUEUE, ADVISORY_QUEUE):
+                    triaged = await redis.xrevrange(queue, count=200)
+                    for _raw_id, fields in (triaged or []):
+                        f = _decode(fields)
+                        rs = f.get("relevance_score")
+                        if rs:
+                            try:
+                                relevance_scores.append(float(rs))
+                            except (ValueError, TypeError):
+                                pass
+
+                avg_relevance = (
+                    round(sum(relevance_scores) / len(relevance_scores), 3)
+                    if relevance_scores else None
+                )
+
+                payload = {
+                    "total_ingested": total_ingested,
+                    "by_priority":    by_priority,
+                    "avg_relevance":  avg_relevance,
+                    "triaged_count":  len(relevance_scores),
+                    "queue_depths": {
+                        "triage":     triage_depth,
+                        "simulation": sim_depth,
+                        "advisory":   adv_depth,
+                    },
+                }
+
+                await manager.broadcast(_envelope("stats", payload))
+
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Stats computation failed: %s", exc)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("Stats loop stopped.")
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -286,8 +369,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.redis_api = redis_api
 
+    # PostgreSQL pool for advisory/finding fallback queries
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+        logger.info("PostgreSQL pool created: %s", DATABASE_URL.split("@")[-1])
+    except Exception as exc:
+        logger.warning("PostgreSQL unavailable (%s) — finding fallback disabled.", exc)
+        db_pool = None
+    app.state.db_pool = db_pool
+
     tail_task      = asyncio.create_task(_tail_detection_loop(redis_stream))
     subscribe_task = asyncio.create_task(_subscribe_loop(redis_pubsub))
+    stats_task     = asyncio.create_task(_stats_loop(redis_stream))
 
     logger.info("AEGIS WebSocket Bridge started. Redis: %s", REDIS_URL)
     try:
@@ -295,10 +388,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         tail_task.cancel()
         subscribe_task.cancel()
-        await asyncio.gather(tail_task, subscribe_task, return_exceptions=True)
+        stats_task.cancel()
+        await asyncio.gather(tail_task, subscribe_task, stats_task, return_exceptions=True)
         await redis_stream.aclose()
         await redis_pubsub.aclose()
         await redis_api.aclose()
+        if db_pool:
+            await db_pool.close()
         logger.info("Bridge stopped.")
 
 
@@ -328,17 +424,88 @@ async def healthz() -> dict[str, str]:
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """
-    Hold each WebSocket connection open.  All data is pushed by the two
-    background tasks; this coroutine only needs to handle disconnects.
+    Hold each WebSocket connection open.  On connect, replay recent events
+    and advisories so the UI shows historical data immediately.
     """
     await manager.connect(ws)
     try:
+        # Send catchup batch of recent events + advisories
+        r: aioredis.Redis = app.state.redis_api
+        await _send_catchup(ws, r)
+
         while True:
             await ws.receive_text()   # keepalive / client ping
     except WebSocketDisconnect:
         pass
     finally:
         manager.disconnect(ws)
+
+
+async def _send_catchup(ws: WebSocket, redis: aioredis.Redis) -> None:
+    """
+    Replay recent events from the detection stream and advisories from
+    the persistent advisory stream so a newly connected UI has context.
+    """
+    try:
+        # Recent detection events (newest first, reversed to chronological)
+        raw_events = await redis.xrevrange(
+            DETECTION_QUEUE, count=CATCHUP_LIMIT,
+        )
+        events = list(reversed(raw_events or []))
+
+        for raw_id, raw_fields in events:
+            fields = _decode(raw_fields)
+            cve_id: str | None = None
+            try:
+                rp = json.loads(fields.get("raw_payload", "{}"))
+                cve_id = rp.get("id") or rp.get("cve_id")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            payload = {
+                "event_id":             fields.get("event_id",    ""),
+                "source_type":          fields.get("source_type", ""),
+                "priority":             fields.get("priority",    "P3"),
+                "stage":                "detected",
+                "routing_target":       fields.get("routing_target", "detection"),
+                "ingested_at":          fields.get("ingested_at",  ""),
+                "simulated_at":         fields.get("simulated_at", ""),
+                "relevance_score":      fields.get("relevance_score"),
+                "infrastructure_match": fields.get("infrastructure_match"),
+                "exploitability":       fields.get("exploitability"),
+                "temporal_urgency":     fields.get("temporal_urgency"),
+                "p_breach":             fields.get("p_breach"),
+                "delta_p_breach":       fields.get("delta_p_breach"),
+                "severity":             fields.get("severity",  "medium"),
+                "summary":              fields.get("summary",   ""),
+                "cve_id":               cve_id,
+                "highest_risk_path":    _try_json(fields.get("highest_risk_path", "[]")),
+                "blind_spots":          _try_json(fields.get("blind_spots",        "[]")),
+            }
+            await ws.send_text(_envelope("event", payload))
+
+        # Recent advisories from persistent stream
+        raw_advisories = await redis.xrevrange(
+            ADVISORY_STREAM, count=CATCHUP_LIMIT,
+        )
+        advisories = list(reversed(raw_advisories or []))
+
+        for raw_id, raw_fields in advisories:
+            fields = _decode(raw_fields)
+            data_str = fields.get("data", "{}")
+            try:
+                data = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            msg_type = data.pop("type", "advisory")
+            await ws.send_text(_envelope(msg_type, data))
+
+        logger.info(
+            "Catchup sent: %d events, %d advisories to new client.",
+            len(events), len(advisories),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Catchup failed: %s — client will only see live data.", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -358,25 +525,31 @@ async def attack_matrix() -> dict:
     """
     r: aioredis.Redis = app.state.redis_api
 
-    hits_raw, priority_raw, actors_raw, updated_at = await asyncio.gather(
-        r.hgetall("aegis:ttp:hits"),
-        r.hgetall("aegis:ttp:priority"),
-        r.hgetall("aegis:ttp:actors"),
-        r.get("aegis:ttp:updated_at"),
+    hits_raw, priority_raw, actors_raw, names_raw, tactics_raw, updated_at = (
+        await asyncio.gather(
+            r.hgetall("aegis:ttp:hits"),
+            r.hgetall("aegis:ttp:priority"),
+            r.hgetall("aegis:ttp:actors"),
+            r.hgetall("aegis:ttp:name"),
+            r.hgetall("aegis:ttp:tactic"),
+            r.get("aegis:ttp:updated_at"),
+        )
     )
 
     techniques: dict[str, dict] = {}
-    all_ids = set(hits_raw) | set(priority_raw) | set(actors_raw)
+    all_ids = set(hits_raw) | set(priority_raw) | set(actors_raw) | set(names_raw) | set(tactics_raw)
     for tid in all_ids:
         hit_val = hits_raw.get(tid)
         techniques[tid] = {
             "hits": int(hit_val) if hit_val else 0,
-            "maxPriority": priority_raw.get(tid, "P3"),
+            "maxPriority": priority_raw.get(tid) or None,
             "actors": [
                 a.strip()
                 for a in (actors_raw.get(tid, "")).split(",")
                 if a.strip()
             ],
+            "name": names_raw.get(tid) or None,
+            "tactic": tactics_raw.get(tid) or None,
         }
 
     return {
@@ -422,15 +595,38 @@ async def attack_matrix() -> dict:
 @app.get("/api/simulation/{event_id}")
 async def get_simulation(event_id: str) -> JSONResponse:
     """
-    Fetch a simulation finding for a specific event from Redis.
+    Fetch a simulation finding for a specific event.
 
-    Key: aegis:sim:findings:{event_id} (JSON string, 24h TTL)
+    Tries Redis first (aegis:sim:findings:{event_id}, 24h TTL),
+    then falls back to PostgreSQL (advisories.finding_json column)
+    for older findings that have expired from the cache.
     """
     r: aioredis.Redis = app.state.redis_api
+
+    # Try Redis first (fast path)
     raw = await r.get(f"aegis:sim:findings:{event_id}")
-    if raw is None:
-        return JSONResponse(status_code=404, content={"error": "not found"})
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return JSONResponse(status_code=500, content={"error": "corrupt finding data"})
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Fall back to PostgreSQL
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT finding_json FROM advisories WHERE event_id = $1",
+                    event_id,
+                )
+            if row and row["finding_json"]:
+                finding = row["finding_json"]
+                # finding_json is stored as JSONB, asyncpg returns it as a dict/str
+                if isinstance(finding, str):
+                    finding = json.loads(finding)
+                return finding
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL finding lookup failed for %s: %s", event_id, exc)
+
+    return JSONResponse(status_code=404, content={"error": "not found"})

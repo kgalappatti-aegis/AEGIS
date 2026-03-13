@@ -157,27 +157,36 @@ Events scoring above `TRIAGE_THRESHOLD` (default: 0.4) are routed to simulation;
 
 A two-process design:
 
-- **simulation-agent**: LangGraph pipeline that selects attack strategies via Claude, dispatches Monte Carlo tasks to Celery, interprets results, queries Neo4j for structured attack paths, and computes SVG layout coordinates.
+- **simulation-agent**: LangGraph pipeline that deterministically selects strategies, dispatches Monte Carlo tasks to Celery, interprets results via Claude, queries Neo4j for structured attack paths, and computes SVG layout coordinates.
 - **simulation-worker**: Celery worker pool executing NumPy-vectorized Monte Carlo sampling across ATT&CK kill chain paths.
 
 **LangGraph topology:**
 
 ```
-load_event → strategy_selector → run_simulation → interpret_results
-           → build_finding_paths → forward_to_detection
+load_event → strategy_selector → run_simulation → interpret_and_build
+                                                   (interpret_results ∥ build_finding_paths)
+                                                → forward_to_detection
 ```
 
-**Attack strategies:**
+`interpret_results` and `build_finding_paths` run in parallel via `asyncio.gather`, saving ~18s of serial LLM latency.
 
-| Strategy | Description |
-|----------|-------------|
-| `shortest_path` | Minimum-hop path through the ATT&CK graph |
-| `evasion_first` | Prioritizes defense-evasion techniques |
-| `vuln_amplified` | Weights paths through known vulnerabilities |
-| `lateral_movement` | Emphasizes lateral movement TTPs |
-| `full_landscape` | Broad coverage of all reachable paths |
+**Attack strategies** (deterministic selection based on triage scores):
 
-The `build_finding_paths` node queries Neo4j with strategy-specific Cypher, computes detection coverage from Redis hashes, assigns SVG coordinates via the layout engine, and writes structured findings to `aegis:sim:findings:{event_id}` (24h TTL).
+| Strategy | Trigger | Description |
+|----------|---------|-------------|
+| `full_landscape` | Always | Broad coverage of all reachable paths |
+| `shortest_path` | CVSS ≥ 9.0 or exploitability ≥ 0.8 | Minimum-hop BFS path through the graph |
+| `vuln_amplified` | CVSS ≥ 9.0 or exploitability ≥ 0.8 | High-probability paths through known vulnerabilities |
+| `lateral_movement` | infrastructure_match ≥ 0.8 | Emphasizes lateral movement TTPs |
+| `evasion_first` | temporal_urgency ≥ 0.8 | Prioritizes defense-evasion techniques |
+
+**Key capabilities:**
+
+- **Smart entry TTP selection**: `pick_entry_ttp()` heuristically selects the initial-access technique based on CVE title (VPN → T1133, phishing → T1566, supply chain → T1195, etc.)
+- **Tactic-chained Neo4j queries**: Constrained tactic-progression queries (initial-access → execution → ... → impact) instead of variable-length path expansion, keeping query time ~1s even with 7,800+ PRECEDES edges
+- **TTP-Rotation**: For P0/P1 events, detected techniques in the best path are paired with structurally equivalent substitutes (same tactic, shared predecessors) to identify evasion alternatives
+- **Delta P(breach)**: Per-path marginal risk increase from a new CVE, computed via numpy-vectorized Beta sampling comparing pre-CVE (tp=0.5) vs post-CVE (tp=0.95) transition probabilities
+- **Real-time ATT&CK updates**: `ttp_update` messages published to `aegis:broadcast` after each simulation, enabling live heatmap updates
 
 ### Detection Agent
 
@@ -191,7 +200,7 @@ Produces executive-grade security advisories via Claude, including:
 - TLP classification and confidence scoring
 - MITRE technique mapping
 
-Advisories are persisted to PostgreSQL (upserted by `event_id`) and broadcast via Redis pub/sub to all connected WebSocket clients.
+Advisories are persisted to PostgreSQL (upserted by `event_id`, with `finding_json` JSONB column for simulation data) and broadcast via both Redis pub/sub (real-time) and a persistent Redis Stream (`aegis:stream:advisories`) for UI catchup on reconnect.
 
 ### Bridge
 
@@ -199,22 +208,26 @@ FastAPI service providing:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/ws` | WebSocket | Live event + advisory stream |
-| `/api/attack-matrix` | GET | ATT&CK heatmap data (hit counts, priority, actors) |
-| `/api/simulation/{event_id}` | GET | Simulation finding with attack paths |
+| `/ws` | WebSocket | Live event + advisory + stats + ttp_update stream |
+| `/api/attack-matrix` | GET | ATT&CK heatmap data (hit counts, priority, actors, technique metadata) |
+| `/api/simulation/{event_id}` | GET | Simulation finding with attack paths (Redis → PostgreSQL fallback) |
 | `/healthz` | GET | Liveness probe |
 
-The bridge runs two background loops:
+The bridge runs three background tasks:
 1. **Detection tail**: XREAD on `aegis:queue:detection`, emits `type: "event"` messages
-2. **Pub/sub subscriber**: Listens on `aegis:broadcast`, emits `type: "advisory"` messages
+2. **Pub/sub subscriber**: Listens on `aegis:broadcast`, emits `type: "advisory"` and `type: "ttp_update"` messages
+3. **Stats loop**: Computes pipeline statistics every 10s and broadcasts `type: "stats"` messages (total ingested, by priority, queue depths, avg relevance)
+
+On WebSocket connect, the bridge replays recent events (via XREVRANGE on the detection stream) and advisories (via the persistent `aegis:stream:advisories` stream) so the UI shows historical data immediately.
 
 ### React Dashboard
 
 Three-tab SPA built with React 18 + Vite:
 
-- **EVENTS**: Real-time event table with priority filtering. Click a row to see triage scores and (for simulated events) an interactive SVG kill chain diagram.
-- **ADVISORIES**: Advisory cards with expandable Sigma rules, coverage gaps, and kill chain visualizations.
-- **ATT&CK**: 14-column MITRE ATT&CK heatmap grid colored by simulation hit count, with actor filtering, list/heatmap views, and click-to-detail panel.
+- **EVENTS**: Real-time event table with priority filtering and deduplication by event_id. Click a row to see triage scores and (for simulated events) an interactive SVG kill chain diagram.
+- **ADVISORIES**: Advisory cards with expandable Sigma rules, coverage gaps, and kill chain visualizations. Deduplicated by event_id.
+- **ATT&CK**: 14-column MITRE ATT&CK heatmap grid colored by simulation hit count. Dynamic technique discovery from API (not limited to a static list). Actor dropdown populated from real simulation data. Live updates via WebSocket `ttp_update` messages. List/heatmap views with click-to-detail panel showing hits, max priority, threat actors, and heat level.
+- **Stats Bar**: Total ingested, by-priority breakdown, triaged count, queue depths — updated every 10s via WebSocket.
 
 ## Redis Key Reference
 
@@ -233,7 +246,11 @@ Three-tab SPA built with React 18 + Vite:
 | `aegis:detection:data_sources` | Hash | TTP data sources |
 | `aegis:ttp:hits` | Hash | TTP simulation hit counts |
 | `aegis:ttp:priority` | Hash | TTP max priority seen |
-| `aegis:ttp:actors` | Hash | TTP actor attributions |
+| `aegis:ttp:actors` | Hash | TTP actor attributions (comma-separated) |
+| `aegis:ttp:name` | Hash | TTP human-readable name |
+| `aegis:ttp:tactic` | Hash | TTP ATT&CK tactic |
+| `aegis:ttp:updated_at` | String | Last TTP aggregation timestamp |
+| `aegis:stream:advisories` | Stream | Persistent advisory stream (for UI catchup) |
 | `aegis:sim:findings:{event_id}` | String (JSON) | Simulation finding (24h TTL) |
 
 ## Neo4j Graph Schema
@@ -299,6 +316,7 @@ AEGIS/
 │   ├── agent.py
 │   ├── config.py
 │   ├── scorer.py
+│   ├── enrichment.py        # Neo4j-backed triage enrichment
 │   ├── requirements.txt
 │   └── Dockerfile
 │
@@ -356,6 +374,9 @@ AEGIS/
 │   ├── nginx.conf
 │   ├── package.json
 │   └── Dockerfile
+│
+├── scripts/                 # Utility scripts
+│   └── sigma_loader.py      # SigmaHQ rule loader → Redis
 │
 └── frontend/                # Legacy SSE dashboard
     ├── main.py

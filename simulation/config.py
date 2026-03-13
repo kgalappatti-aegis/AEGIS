@@ -15,9 +15,10 @@ load_dotenv()
 # Redis stream keys
 # ---------------------------------------------------------------------------
 
-SIMULATION_QUEUE = "aegis:queue:simulation"
-DETECTION_QUEUE  = "aegis:queue:detection"
-CONSUMER_GROUP   = "orchestrator-group"
+SIMULATION_QUEUE  = "aegis:queue:simulation"
+DETECTION_QUEUE   = "aegis:queue:detection"
+BROADCAST_CHANNEL = "aegis:broadcast"
+CONSUMER_GROUP    = "orchestrator-group"
 
 # ---------------------------------------------------------------------------
 # Monte Carlo constants

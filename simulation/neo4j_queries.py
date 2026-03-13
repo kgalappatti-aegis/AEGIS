@@ -22,20 +22,31 @@ logger = logging.getLogger("aegis.simulation.neo4j")
 # Strategy-specific Cypher queries  (Part 2)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tactic-chained queries: walk one TTP per tactic instead of enumerating
+# all variable-length paths.  With 7,822 PRECEDES edges and supernodes at
+# 85+ out-degree, *3..6 expansion is combinatorially explosive (~148M paths).
+#
+# These queries constrain the search at each hop by matching a specific
+# tactic progression: initial-access → execution → persistence → priv-esc
+# → defense-evasion → credential-access → discovery → lateral → collection
+# → c2 → exfiltration → impact.  Each step picks one random TTP from the
+# tactic, keeping the search space bounded.
+# ---------------------------------------------------------------------------
+
 _CYPHER_EVASION_FIRST = """
-MATCH path = (entry:TTP)-[:PRECEDES*3..8]->(exit:TTP)
-WHERE entry.tactic IN ['initial-access', 'execution']
-  AND exit.tactic IN ['impact', 'exfiltration']
-  AND ALL(r IN relationships(path) WHERE r.transition_probability > 0.3)
+MATCH (n1:TTP {tactic: 'initial-access'})-[r1:PRECEDES]->(n2:TTP {tactic: 'execution'})
+MATCH (n2)-[r2:PRECEDES]->(n3:TTP {tactic: 'defense-evasion'})
+MATCH (n3)-[r3:PRECEDES]->(n4:TTP {tactic: 'credential-access'})
+MATCH (n4)-[r4:PRECEDES]->(n5:TTP {tactic: 'discovery'})
+MATCH (n5)-[r5:PRECEDES]->(n6:TTP {tactic: 'lateral-movement'})
+WITH n1, n2, n3, n4, n5, n6, r1, r2, r3, r4, r5 LIMIT 30
+MATCH path = (n1)-[r1]->(n2)-[r2]->(n3)-[r3]->(n4)-[r4]->(n5)-[r5]->(n6)
 OPTIONAL MATCH (a:ThreatActor {name: $actor_name})-[:USES]->(t:TTP)
   WHERE t IN nodes(path)
-WITH path,
-     [n IN nodes(path) WHERE n.tactic IN
-       ['defense-evasion','credential-access'] | n] AS evasion_nodes,
-     COUNT(DISTINCT t) AS actor_overlap
-WHERE SIZE(evasion_nodes) >= 1
+WITH path, COUNT(DISTINCT t) AS actor_overlap
 RETURN path, actor_overlap
-ORDER BY actor_overlap DESC, SIZE(nodes(path)) ASC
+ORDER BY actor_overlap DESC
 LIMIT 3
 """
 
@@ -54,11 +65,15 @@ LIMIT 3
 """
 
 _CYPHER_LATERAL_MOVEMENT = """
-MATCH path = (entry:TTP)-[:PRECEDES*4..10]->(exit:TTP)
-WHERE entry.tactic IN ['initial-access']
-  AND exit.tactic IN ['impact', 'exfiltration']
-  AND ANY(n IN nodes(path) WHERE n.tactic = 'lateral-movement')
-  AND ANY(n IN nodes(path) WHERE n.tactic = 'discovery')
+MATCH (n1:TTP {tactic: 'initial-access'})-[r1:PRECEDES]->(n2:TTP {tactic: 'execution'})
+MATCH (n2)-[r2:PRECEDES]->(n3:TTP {tactic: 'persistence'})
+MATCH (n3)-[r3:PRECEDES]->(n4:TTP {tactic: 'privilege-escalation'})
+MATCH (n4)-[r4:PRECEDES]->(n5:TTP {tactic: 'defense-evasion'})
+MATCH (n5)-[r5:PRECEDES]->(n6:TTP {tactic: 'credential-access'})
+MATCH (n6)-[r6:PRECEDES]->(n7:TTP {tactic: 'discovery'})
+MATCH (n7)-[r7:PRECEDES]->(n8:TTP {tactic: 'lateral-movement'})
+WITH n1, n2, n3, n4, n5, n6, n7, n8, r1, r2, r3, r4, r5, r6, r7 LIMIT 30
+MATCH path = (n1)-[r1]->(n2)-[r2]->(n3)-[r3]->(n4)-[r4]->(n5)-[r5]->(n6)-[r6]->(n7)-[r7]->(n8)
 OPTIONAL MATCH (a:ThreatActor {name: $actor_name})-[:USES]->(t:TTP)
   WHERE t IN nodes(path)
 WITH path, COUNT(DISTINCT t) AS actor_overlap
@@ -68,27 +83,29 @@ LIMIT 3
 """
 
 _CYPHER_VULN_AMPLIFIED = """
-MATCH path = (entry:TTP)-[:PRECEDES*3..8]->(exit:TTP)
-WHERE entry.tactic IN ['initial-access', 'execution']
-  AND exit.tactic IN ['impact', 'exfiltration']
-  AND ALL(r IN relationships(path) WHERE r.transition_probability > 0.3)
-  AND ANY(n IN nodes(path) WHERE n.tactic IN
-    ['privilege-escalation', 'impact'])
+MATCH (n1:TTP {tactic: 'initial-access'})-[r1:PRECEDES]->(n2:TTP {tactic: 'execution'})
+MATCH (n2)-[r2:PRECEDES]->(n3:TTP {tactic: 'persistence'})
+MATCH (n3)-[r3:PRECEDES]->(n4:TTP {tactic: 'privilege-escalation'})
+MATCH (n4)-[r4:PRECEDES]->(n5:TTP {tactic: 'defense-evasion'})
+WHERE ALL(r IN [r1, r2, r3, r4] WHERE r.transition_probability > 0.3)
+WITH n1, n2, n3, n4, n5, r1, r2, r3, r4 LIMIT 30
+MATCH path = (n1)-[r1]->(n2)-[r2]->(n3)-[r3]->(n4)-[r4]->(n5)
 OPTIONAL MATCH (a:ThreatActor {name: $actor_name})-[:USES]->(t:TTP)
   WHERE t IN nodes(path)
 WITH path, COUNT(DISTINCT t) AS actor_overlap
 RETURN path, actor_overlap
-ORDER BY SIZE(nodes(path)) DESC, actor_overlap DESC
+ORDER BY actor_overlap DESC
 LIMIT 3
 """
 
 _CYPHER_ACTOR_EMULATION = """
 MATCH (a:ThreatActor {name: $actor_name})-[:USES]->(t:TTP)
 WITH COLLECT(t.mitre_id) AS actor_ttps
-MATCH path = (entry:TTP)-[:PRECEDES*3..8]->(exit:TTP)
-WHERE entry.tactic IN ['initial-access']
-  AND exit.tactic IN ['impact', 'exfiltration']
-  AND ALL(n IN nodes(path) WHERE n.mitre_id IN actor_ttps)
+MATCH (n1:TTP {tactic: 'initial-access'})-[r1:PRECEDES]->(n2:TTP)-[r2:PRECEDES]->(n3:TTP)-[r3:PRECEDES]->(n4:TTP)
+WHERE n4.tactic IN ['impact', 'exfiltration']
+  AND ALL(n IN [n1, n2, n3, n4] WHERE n.mitre_id IN actor_ttps)
+WITH n1, n2, n3, n4, r1, r2, r3 LIMIT 30
+MATCH path = (n1)-[r1]->(n2)-[r2]->(n3)-[r3]->(n4)
 RETURN path, SIZE(nodes(path)) AS actor_overlap
 ORDER BY actor_overlap DESC
 LIMIT 3
@@ -142,9 +159,15 @@ async def async_query_paths(
     driver: AsyncDriver,
     actor_name: str | None,
     strategy: str,
+    entry_ttp: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run strategy-specific Cypher to fetch attack paths from Neo4j.
+
+    If ``entry_ttp`` is provided, paths starting with that technique are
+    preferred (sorted to the front).  The query itself is not filtered by
+    entry_ttp to avoid returning empty results when the entry technique
+    has no PRECEDES edges in the requested tactic chain.
 
     Returns a list of path dicts, each containing:
       nodes:       [{ mitre_id, name, tactic, platform }]
@@ -159,10 +182,18 @@ async def async_query_paths(
     # If no actor, skip actor-dependent strategies
     effective_actor = actor_name or "__NO_ACTOR__"
 
+    # Transaction timeout (ms) to prevent variable-length expansion queries
+    # from hanging Neo4j.  shortestPath is fast; *3..8 expansions can be slow.
+    _TX_TIMEOUT_MS = 10_000
+
     paths: list[dict[str, Any]] = []
     try:
         async with driver.session() as session:
-            result = await session.run(cypher, actor_name=effective_actor)
+            result = await session.run(
+                cypher,
+                actor_name=effective_actor,
+                timeout=_TX_TIMEOUT_MS,
+            )
             records = [r async for r in result]
             for rec in records:
                 data = _extract_path_data(rec)
@@ -179,7 +210,9 @@ async def async_query_paths(
         try:
             async with driver.session() as session:
                 result = await session.run(
-                    _CYPHER_SHORTEST_PATH, actor_name=effective_actor,
+                    _CYPHER_SHORTEST_PATH,
+                    actor_name=effective_actor,
+                    timeout=_TX_TIMEOUT_MS,
                 )
                 records = [r async for r in result]
                 for rec in records:
@@ -188,6 +221,12 @@ async def async_query_paths(
                         paths.append(data)
         except Exception as exc:
             logger.warning("Fallback shortest_path query failed: %s", exc)
+
+    # Prefer paths that start with the heuristically selected entry TTP
+    if entry_ttp and len(paths) > 1:
+        paths.sort(
+            key=lambda p: 0 if p["nodes"][0].get("mitre_id") == entry_ttp else 1,
+        )
 
     return paths
 
@@ -216,6 +255,41 @@ async def async_get_top_actor(
     except Exception as exc:
         logger.warning("Top actor query failed: %s", exc)
         return None
+
+
+async def async_get_ttp_substitutes(
+    driver: AsyncDriver,
+    mitre_id: str,
+    tactic: str,
+) -> list[dict[str, Any]]:
+    """
+    TTP-Rotation: find techniques in the same tactic that have a PRECEDES
+    relationship from the same predecessor nodes (structurally substitutable).
+
+    Used to suggest evasion alternatives for techniques that are already
+    detected by the defender.
+    """
+    if not mitre_id or not tactic:
+        return []
+    try:
+        async with driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (pred:TTP)-[:PRECEDES]->(original:TTP {mitre_id: $mitre_id})
+                MATCH (pred)-[:PRECEDES]->(sub:TTP)
+                WHERE sub.tactic = $tactic
+                  AND sub.mitre_id <> $mitre_id
+                RETURN DISTINCT sub.mitre_id AS mitre_id, sub.name AS name,
+                       sub.tactic AS tactic, sub.description AS description
+                LIMIT 6
+                """,
+                mitre_id=mitre_id,
+                tactic=tactic,
+            )
+            return [dict(r) async for r in result]
+    except Exception as exc:
+        logger.warning("TTP substitutes query failed for %s: %s", mitre_id, exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -379,18 +453,40 @@ def sync_get_detection_coverage(
     """
     Return the detection coverage score [0, 1] for a TTP.
 
-    Phase 3 stub: always returns 0.5.
-    Phase 4 will query a DetectionRule node and return coverage based on
-    deployed SIEM/EDR rules mapped to the TTP.
+    Reads from Redis ``aegis:detection:score`` hash (populated by
+    SigmaHQ loader and/or the detection agent).  Falls back to 0.5
+    if Redis is unavailable or the TTP has no coverage data.
     """
-    # Stub — Phase 4 implementation:
-    # with driver.session() as session:
-    #     result = session.run(
-    #         "MATCH (t:TTP {mitre_id: $mid})<-[:COVERS]-(r:DetectionRule) "
-    #         "WHERE r.deployed = true "
-    #         "RETURN avg(r.coverage_score) AS cov",
-    #         mid=mitre_id,
-    #     )
-    #     row = result.single()
-    #     return float(row["cov"]) if row and row["cov"] else 0.0
+    try:
+        score_str = _coverage_cache.get(mitre_id)
+        if score_str is not None:
+            return float(score_str)
+    except (TypeError, ValueError):
+        pass
     return 0.5
+
+
+# In-process coverage cache — populated once per worker via _warm_coverage_cache()
+_coverage_cache: dict[str, str] = {}
+
+
+def warm_coverage_cache(redis_url: str) -> None:
+    """
+    Load ``aegis:detection:score`` from Redis into an in-process dict.
+
+    Called once per Celery worker process at startup.  Avoids per-TTP
+    Redis round-trips during Monte Carlo simulation.
+    """
+    import redis as sync_redis
+
+    try:
+        r = sync_redis.from_url(redis_url, decode_responses=True)
+        raw = r.hgetall("aegis:detection:score") or {}
+        _coverage_cache.update(raw)
+        r.close()
+        logger.info(
+            "Coverage cache warmed: %d techniques from aegis:detection:score.",
+            len(_coverage_cache),
+        )
+    except Exception as exc:
+        logger.warning("Coverage cache warm failed: %s — using 0.5 fallback.", exc)

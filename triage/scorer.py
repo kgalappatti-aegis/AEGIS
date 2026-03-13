@@ -4,7 +4,10 @@ AEGIS Triage – Relevance Scorer
 Sub-score definitions
 ---------------------
 infrastructure_match  – How much the threat overlaps known infrastructure.
-                        1.0 if CVSS baseScore ≥ 7.0, else 0.5.
+                        Base: 1.0 if CVSS baseScore >= 7.0, else 0.5.
+                        Boosted by: SSVC technical_impact = "total" (→1.0),
+                        SSVC automatable = "yes" (→0.85), OSV affected
+                        packages found (→0.8, or 0.9 if fix available).
 
 threat_actor_history  – Confidence that a tracked threat actor is involved.
                         Queries the Neo4j graph when a driver is available;
@@ -16,9 +19,14 @@ threat_actor_history  – Confidence that a tracked threat actor is involved.
                           0.6  actor known but only other tactics
                           0.3  actor unknown to the graph
 
-exploitability        – CVSS baseScore / 10.0; default 0.5.
+exploitability        – EPSS score (model-backed exploitation probability)
+                        from FIRST.org, [0, 1].  Falls back to CVSS/10.0
+                        when EPSS is unavailable.
+                        Boosted to max(score, 0.85) if SSVC exploitation
+                        is "active" or CVE is in CISA KEV.
 
-temporal_urgency      – 1.0 if published ≤ 7 days ago, else 0.3.
+temporal_urgency      – 1.0 if CVE is in CISA KEV (actively exploited) or
+                        published <= 7 days ago.  0.3 otherwise.
 
 relevance_score       – Weighted sum:
                           infrastructure_match * 0.40
@@ -35,6 +43,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import TEMPORAL_URGENCY_WINDOW_DAYS, WEIGHTS
+from enrichment import EnrichmentData
 
 logger = logging.getLogger("aegis.triage.scorer")
 
@@ -55,7 +64,7 @@ _RELEVANT_TACTICS = frozenset([
 def extract_cvss_score(raw_payload: dict[str, Any]) -> float | None:
     """
     Pull the highest-quality CVSS base score out of raw_payload.metrics.
-    Preference: CVSSv3.1 → CVSSv3.0 → CVSSv2, Primary source preferred.
+    Preference: CVSSv3.1 -> CVSSv3.0 -> CVSSv2, Primary source preferred.
     """
     metrics = raw_payload.get("metrics", {})
     for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
@@ -95,10 +104,26 @@ def _parse_published(raw_payload: dict[str, Any]) -> datetime | None:
 # Sub-scorers
 # ---------------------------------------------------------------------------
 
-def score_infrastructure_match(cvss_score: float | None) -> float:
-    if cvss_score is None:
-        return 0.5
-    return 1.0 if cvss_score >= 7.0 else 0.5
+def score_infrastructure_match(
+    cvss_score: float | None,
+    enrichment: EnrichmentData,
+) -> float:
+    base = 1.0 if (cvss_score is not None and cvss_score >= 7.0) else 0.5
+
+    # SSVC boosts: automatable or total-impact threats are infra-relevant
+    if enrichment.ssvc_technical_impact and enrichment.ssvc_technical_impact.lower() == "total":
+        base = max(base, 1.0)
+    if enrichment.ssvc_automatable and enrichment.ssvc_automatable.lower() == "yes":
+        base = max(base, 0.85)
+
+    # OSV: affected packages in known ecosystems = direct infra overlap signal
+    if enrichment.osv_affected_packages:
+        base = max(base, 0.8)
+        # Fix available but not applied is even more infra-relevant
+        if enrichment.osv_fix_available:
+            base = max(base, 0.9)
+
+    return base
 
 
 async def score_threat_actor_history(
@@ -145,13 +170,40 @@ async def score_threat_actor_history(
     return 0.6
 
 
-def score_exploitability(cvss_score: float | None) -> float:
-    if cvss_score is None:
-        return 0.5
-    return max(0.0, min(1.0, cvss_score / 10.0))
+def score_exploitability(
+    cvss_score: float | None,
+    enrichment: EnrichmentData,
+) -> float:
+    # Primary: EPSS (model-backed exploitation probability)
+    if enrichment.epss_score is not None:
+        score = enrichment.epss_score
+    elif cvss_score is not None:
+        # Fallback: CVSS / 10
+        score = max(0.0, min(1.0, cvss_score / 10.0))
+    else:
+        score = 0.5
+
+    # Hard boost: KEV or SSVC "active" exploitation means confirmed exploit
+    if enrichment.in_kev:
+        score = max(score, 0.85)
+    if enrichment.ssvc_exploitation and enrichment.ssvc_exploitation.lower() == "active":
+        score = max(score, 0.85)
+
+    return score
 
 
-def score_temporal_urgency(published_at: datetime | None) -> float:
+def score_temporal_urgency(
+    published_at: datetime | None,
+    enrichment: EnrichmentData,
+) -> float:
+    # KEV hit = actively exploited in the wild → maximum urgency
+    if enrichment.in_kev:
+        return 1.0
+
+    # SSVC "active" exploitation is equivalent
+    if enrichment.ssvc_exploitation and enrichment.ssvc_exploitation.lower() == "active":
+        return 1.0
+
     if published_at is None:
         return 0.3
     age_days = (datetime.now(timezone.utc) - published_at).days
@@ -185,10 +237,11 @@ async def compute_scores(
     *,
     neo4j_driver: Any = None,
     actor_name: str = "",
+    enrichment: EnrichmentData | None = None,
 ) -> TriageScores:
     """
-    Derive all four sub-scores from raw_payload and combine into a
-    weighted relevance_score.
+    Derive all four sub-scores from raw_payload and external enrichment,
+    then combine into a weighted relevance_score.
 
     Parameters
     ----------
@@ -198,14 +251,19 @@ async def compute_scores(
                     graph query; otherwise falls back to 0.5.
     actor_name    : Threat-actor name to look up.  Typically empty for
                     raw NVD events; set when actor attribution is known.
+    enrichment    : External enrichment data (EPSS, KEV, CIRCL).
+                    When None, scoring falls back to CVSS-only stubs.
     """
+    if enrichment is None:
+        enrichment = EnrichmentData()
+
     cvss     = extract_cvss_score(raw_payload)
     pub_date = _parse_published(raw_payload)
     cve_id   = raw_payload.get("id") or raw_payload.get("cve_id") or ""
 
-    infra   = score_infrastructure_match(cvss)
-    exploit = score_exploitability(cvss)
-    urgency = score_temporal_urgency(pub_date)
+    infra   = score_infrastructure_match(cvss, enrichment)
+    exploit = score_exploitability(cvss, enrichment)
+    urgency = score_temporal_urgency(pub_date, enrichment)
 
     if neo4j_driver is not None:
         try:
@@ -217,6 +275,16 @@ async def compute_scores(
     else:
         actor = 0.5   # Phase 2 neutral default when Neo4j not configured
 
+    # ThreatFox / MalwareBazaar actor attribution boosts
+    # If ThreatFox identified a known actor, that's a direct attribution signal
+    if enrichment.threatfox_actor:
+        actor = max(actor, 0.8)
+    if enrichment.threatfox_malware:
+        actor = max(actor, 0.7)
+    # MalwareBazaar: known malware family = moderate actor signal
+    if enrichment.malware_family:
+        actor = max(actor, 0.65)
+
     relevance = (
         infra   * WEIGHTS["infrastructure_match"]
         + actor   * WEIGHTS["threat_actor_history"]
@@ -225,11 +293,13 @@ async def compute_scores(
     )
     relevance = round(max(0.0, min(1.0, relevance)), 6)
 
-    if cvss is not None:
+    if cvss is not None or enrichment.epss_score is not None:
         logger.debug(
-            "Scores for CVSS %.1f (pub=%s): %s",
-            cvss,
-            pub_date.date() if pub_date else "unknown",
+            "Scores for %s (CVSS=%s EPSS=%s KEV=%s): %s",
+            cve_id,
+            f"{cvss:.1f}" if cvss else "?",
+            f"{enrichment.epss_score:.4f}" if enrichment.epss_score is not None else "?",
+            "YES" if enrichment.in_kev else "no",
             TriageScores(infra, actor, exploit, urgency, relevance),
         )
 

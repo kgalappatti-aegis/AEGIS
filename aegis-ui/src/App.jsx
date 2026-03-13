@@ -933,7 +933,14 @@ export default function App() {
 
       if (msg.type === 'event') {
         const ev = { ...msg.payload, ts: msg.ts, _uid: uid() };
-        setEvents(prev => [ev, ...prev].slice(0, MAX_EVENTS));
+        setEvents(prev => {
+          // Deduplicate by event_id — update existing or prepend new
+          const eid = ev.event_id;
+          if (eid && prev.some(e => e.event_id === eid)) {
+            return prev.map(e => e.event_id === eid ? { ...ev, _uid: e._uid } : e);
+          }
+          return [ev, ...prev].slice(0, MAX_EVENTS);
+        });
         flash(setNewEvIds, ev._uid);
 
       } else if (msg.type === 'stats') {
@@ -941,7 +948,13 @@ export default function App() {
 
       } else if (msg.type === 'advisory') {
         const adv = { ...msg.payload, ts: msg.ts, _uid: uid() };
-        setAdvisories(prev => [adv, ...prev].slice(0, MAX_ADVISORIES));
+        setAdvisories(prev => {
+          const eid = adv.event_id;
+          if (eid && prev.some(a => a.event_id === eid)) {
+            return prev.map(a => a.event_id === eid ? { ...adv, _uid: a._uid } : a);
+          }
+          return [adv, ...prev].slice(0, MAX_ADVISORIES);
+        });
         flash(setNewAdvIds, adv._uid);
         if (activeTabRef.current !== 'advisories') {
           setUnread(n => n + 1);

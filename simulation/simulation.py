@@ -32,7 +32,7 @@ from config import (
     MAX_PATHS_PER_TASK,
     settings,
 )
-from neo4j_queries import sync_get_attack_paths, sync_get_detection_coverage
+from neo4j_queries import sync_get_attack_paths, sync_get_detection_coverage, warm_coverage_cache
 
 logger = logging.getLogger("aegis.simulation.worker")
 
@@ -55,6 +55,14 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,  # one task at a time per worker slot
     result_expires=3600,
 )
+
+
+
+
+# Warm the detection coverage cache at import time.
+# In prefork mode, the main process loads this module, warms the cache,
+# then forks — child workers inherit the populated dict.
+warm_coverage_cache(settings.redis_url)
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +278,52 @@ def _aggregate_results(
         "p_breach":         p_breach,
         "top_paths":        top_paths,
     }
+
+
+# ---------------------------------------------------------------------------
+# Delta P(breach): marginal risk increase from a new CVE
+# ---------------------------------------------------------------------------
+
+def compute_delta_p_breach(
+    p_breach_current: float,
+    cve_step_probs: list[float],
+    n_iterations: int = 1000,
+) -> float:
+    """
+    Quantify the marginal risk increase from a new CVE.
+
+    Compares the current p_breach against a counterfactual baseline where
+    CVE-relevant steps (initial-access / execution / priv-esc) have lower
+    transition probability (0.5 → "hard to exploit without CVE").
+
+    The post-CVE transition probability is set to 0.95 ("trivial with CVE"),
+    matching the spec's model.
+
+    Returns: delta = p_breach_post_cve - p_breach_pre_cve (can be negative
+    if improved detection offsets the CVE).
+    """
+    if not cve_step_probs:
+        return 0.0
+
+    n_steps = len(cve_step_probs)
+
+    # Pre-CVE baseline: hard to exploit (transition_probability = 0.5)
+    pre_probs = np.full(n_steps, 0.5, dtype=float)
+    pre_alphas = BETA_ALPHA_PRIOR + pre_probs * BETA_EFFECTIVE_N
+    pre_betas  = BETA_BETA_PRIOR  + (1.0 - pre_probs) * BETA_EFFECTIVE_N
+    pre_sampled = np.random.beta(pre_alphas, pre_betas, size=(n_iterations, n_steps))
+    pre_success = np.all(np.random.random((n_iterations, n_steps)) < pre_sampled, axis=1)
+    p_breach_pre = float(pre_success.mean())
+
+    # Post-CVE: trivial to exploit (transition_probability = 0.95)
+    post_probs = np.full(n_steps, 0.95, dtype=float)
+    post_alphas = BETA_ALPHA_PRIOR + post_probs * BETA_EFFECTIVE_N
+    post_betas  = BETA_BETA_PRIOR  + (1.0 - post_probs) * BETA_EFFECTIVE_N
+    post_sampled = np.random.beta(post_alphas, post_betas, size=(n_iterations, n_steps))
+    post_success = np.all(np.random.random((n_iterations, n_steps)) < post_sampled, axis=1)
+    p_breach_post = float(post_success.mean())
+
+    return round(p_breach_post - p_breach_pre, 4)
 
 
 # ---------------------------------------------------------------------------
