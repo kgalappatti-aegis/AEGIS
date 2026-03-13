@@ -1,0 +1,18 @@
+# AEGIS Test Harness runner
+# Usage: docker compose run --rm harness demo
+#        docker compose run --rm harness scenario --name apt29-intrusion
+#        docker compose run --rm harness smoke
+#        docker compose run --rm harness status
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir redis python-dotenv
+
+COPY aegis_harness.py .
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "aegis_harness.py"]
+CMD ["status"]

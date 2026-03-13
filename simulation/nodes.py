@@ -167,8 +167,21 @@ def load_event(state: SimulationState) -> dict[str, Any]:
             break
 
     # Select contextually appropriate entry TTP based on CVE/title
-    title = raw_payload.get("name", "") or raw_payload.get("title", "")
+    title = raw_payload.get("name", "") or raw_payload.get("title", "") or raw_payload.get("info", "")
     entry_ttp = pick_entry_ttp(cve_id, title)
+
+    # MISP-sourced events may carry pre-tagged ATT&CK techniques
+    misp_techniques: list[str] = raw_payload.get("misp_techniques", [])
+    if misp_techniques:
+        # Use the first MISP technique as entry TTP if it's an initial-access TTP
+        for mt in misp_techniques:
+            if mt in ENTRY_TTPS:
+                entry_ttp = mt
+                break
+        logger.info(
+            "MISP techniques detected: %s (entry override: %s)",
+            misp_techniques[:5], entry_ttp,
+        )
 
     logger.info(
         "Loaded event %s (CVE=%s, CVSS=%s, relevance=%.3f, entry=%s)",
@@ -462,6 +475,9 @@ async def build_finding_paths(
         (_bstr(k)): _bstr(v) for k, v in sig_raw.items()
     }
 
+    # ── MISP techniques: use as supplementary TTP seed ────────────────
+    misp_techniques: list[str] = (state.get("raw_payload") or {}).get("misp_techniques", [])
+
     # ── Determine actor name from TTPs (extracted from sim results) ──
     # Pull TTP steps directly from simulation results so this node
     # does not depend on interpret_results (enables parallel execution).
@@ -477,8 +493,15 @@ async def build_finding_paths(
         t for t in highest_risk_path
         if isinstance(t, str) and t.startswith("T")
     )
+    # Include MISP-tagged techniques in the TTP set for actor resolution
+    all_ttp_ids.extend(t for t in misp_techniques if t not in all_ttp_ids)
     ttp_ids = list(dict.fromkeys(all_ttp_ids))  # dedupe, preserve order
     actor_name = await async_get_top_actor(driver, ttp_ids)
+    # MISP events may carry explicit actor attribution
+    if not actor_name:
+        misp_actors = (state.get("raw_payload") or {}).get("threat_actors", [])
+        if misp_actors:
+            actor_name = misp_actors[0]
 
     # ── Part 2: Query Neo4j paths per strategy ────────────────────────
     finding_paths: list[dict[str, Any]] = []
@@ -713,6 +736,16 @@ async def forward_to_detection(
 
         # ── Write TTP aggregation hashes and per-finding key ──────────
         await _write_ttp_aggregation(redis, state)
+
+        # Publish stage update for live UI tracking
+        event_id = state.get("event_id", "")
+        if event_id:
+            await redis.hset("aegis:event:stages", event_id, "simulated")
+            await redis.publish("aegis:broadcast", json.dumps({
+                "type": "stage_update",
+                "event_id": event_id,
+                "stage": "simulated",
+            }))
 
         return {"forwarded": True, "forward_error": None}
 

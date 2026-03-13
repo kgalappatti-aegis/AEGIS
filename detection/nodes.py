@@ -187,6 +187,22 @@ async def _fetch_mitre_context(
     return hint, data_sources
 
 
+async def _fetch_atomic_tests(
+    redis: aioredis.Redis,
+    ttp_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch Atomic Red Team test metadata for a technique from Redis."""
+    raw = await redis.hget("aegis:atomic:tests", ttp_id)
+    if not raw:
+        return []
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 async def _generate_ttp_detection(
     client: AsyncAnthropic,
     redis: aioredis.Redis,
@@ -197,11 +213,27 @@ async def _generate_ttp_detection(
 ) -> dict[str, Any] | None:
     """Generate a Sigma rule for a single TTP using MITRE grounding context."""
     hint, data_sources = await _fetch_mitre_context(redis, ttp_id)
+    atomic_tests = await _fetch_atomic_tests(redis, ttp_id)
 
     ds_block = (
         "\n".join(f"  - {ds}" for ds in data_sources)
         if data_sources else "  (none documented)"
     )
+
+    # Build Atomic Red Team context block
+    atomic_block = ""
+    if atomic_tests:
+        atomic_lines = []
+        for t in atomic_tests[:5]:  # cap at 5 to stay within prompt budget
+            plats = ", ".join(t.get("supported_platforms", []))
+            atomic_lines.append(
+                f"  - {t['name']} [{t['executor']}] ({plats})"
+                f"{' (requires elevation)' if t.get('elevation_required') else ''}"
+            )
+        atomic_block = (
+            f"\n\nAtomic Red Team validation tests ({len(atomic_tests)} available):\n"
+            + "\n".join(atomic_lines)
+        )
 
     user_content = (
         f"Technique: {ttp_id} — {ttp_name}\n"
@@ -209,7 +241,8 @@ async def _generate_ttp_detection(
         f"Platform: {platform}\n\n"
         f"MITRE detection guidance:\n"
         f"{hint if hint else '(none documented)'}\n\n"
-        f"MITRE data sources:\n{ds_block}\n\n"
+        f"MITRE data sources:\n{ds_block}"
+        f"{atomic_block}\n\n"
         f"Generate:\n"
         f"1. A Sigma rule (YAML) targeting the most specific data source above.\n"
         f"   Use Sigma's logsource.category matching the first data source listed.\n"
@@ -251,8 +284,23 @@ async def _generate_ttp_detection(
             "aegis:detection:score", ttp_id, str(round(score, 3))
         )
 
+        # Attach Atomic Red Team validation tests
+        if atomic_tests:
+            result["atomic_tests"] = [
+                {
+                    "name":       t["name"],
+                    "guid":       t["guid"],
+                    "executor":   t["executor"],
+                    "platforms":  t.get("supported_platforms", []),
+                    "github_url": t.get("github_url", ""),
+                }
+                for t in atomic_tests[:3]  # top 3 most relevant
+            ]
+            result["atomic_test_count"] = len(atomic_tests)
+
         logger.info(
-            "TTP %s detection: coverage=%s score=%.3f", ttp_id, coverage, score,
+            "TTP %s detection: coverage=%s score=%.3f atomic_tests=%d",
+            ttp_id, coverage, score, len(atomic_tests),
         )
         return result
 
@@ -318,11 +366,37 @@ async def generate_detections(
 
         detection_summary = parsed.get("detection_summary", "")
 
-        # Generate grounded TTP-level detections for techniques in the path
-        risk_path = state.get("highest_risk_path", [])
-        for ttp_id in risk_path:
-            if not isinstance(ttp_id, str) or not ttp_id.startswith("T"):
-                continue
+        # Generate grounded TTP-level detections for techniques in the path.
+        # Collect TTPs from multiple sources to handle empty risk paths.
+        ttp_ids: list[str] = []
+        seen_ttps: set[str] = set()
+
+        # Source 1: highest risk path from simulation
+        for t in state.get("highest_risk_path", []):
+            if isinstance(t, str) and t.startswith("T") and t not in seen_ttps:
+                ttp_ids.append(t)
+                seen_ttps.add(t)
+
+        # Source 2: MITRE technique tags from generated Sigma rules
+        for rule in sigma_rules:
+            rule_text = rule if isinstance(rule, str) else json.dumps(rule)
+            for m in re.finditer(r"attack\.t(\d{4}(?:\.\d{3})?)", rule_text, re.IGNORECASE):
+                tid = f"T{m.group(1)}"
+                if tid not in seen_ttps:
+                    ttp_ids.append(tid)
+                    seen_ttps.add(tid)
+
+        # Source 3: recommended_detections from simulation
+        for rd in state.get("recommended_detections", []):
+            if isinstance(rd, str):
+                for m in re.finditer(r"(T\d{4}(?:\.\d{3})?)", rd):
+                    tid = m.group(1)
+                    if tid not in seen_ttps:
+                        ttp_ids.append(tid)
+                        seen_ttps.add(tid)
+
+        validation_tests: list[dict[str, Any]] = []
+        for ttp_id in ttp_ids:
             ttp_result = await _generate_ttp_detection(
                 client=client,
                 redis=redis,
@@ -335,16 +409,22 @@ async def generate_detections(
                 sigma_rules.append(ttp_result["sigma_rule"])
             if ttp_result and ttp_result.get("coverage_gaps"):
                 coverage_gaps.extend(ttp_result["coverage_gaps"])
+            # Collect Atomic Red Team validation tests
+            if ttp_result and ttp_result.get("atomic_tests"):
+                for at in ttp_result["atomic_tests"]:
+                    at["technique_id"] = ttp_id
+                    validation_tests.append(at)
 
         logger.info(
-            "Detection generation for %s: %d Sigma rules, %d coverage gaps.",
-            cve_id, len(sigma_rules), len(coverage_gaps),
+            "Detection generation for %s: %d Sigma rules, %d coverage gaps, %d validation tests.",
+            cve_id, len(sigma_rules), len(coverage_gaps), len(validation_tests),
         )
 
         return {
             "sigma_rules":       sigma_rules,
             "coverage_gaps":     coverage_gaps,
             "detection_summary": detection_summary,
+            "validation_tests":  validation_tests,
         }
 
     except Exception as exc:
@@ -405,6 +485,7 @@ async def forward_to_advisory(
         # Detection output
         "sigma_rules":       json.dumps(state.get("sigma_rules",       [])),
         "coverage_gaps":     json.dumps(state.get("coverage_gaps",     [])),
+        "validation_tests":  json.dumps(state.get("validation_tests",  [])),
         "detection_summary": state.get("detection_summary", ""),
         "detected_at":       datetime.now(timezone.utc).isoformat(),
     }
@@ -423,6 +504,17 @@ async def forward_to_advisory(
         )
         if msg_id:
             await redis.xack(DETECTION_QUEUE, CONSUMER_GROUP, msg_id)
+
+        # Publish stage update for live UI tracking
+        event_id = state.get("event_id", "")
+        if event_id:
+            await redis.hset("aegis:event:stages", event_id, "detected")
+            await redis.publish("aegis:broadcast", json.dumps({
+                "type": "stage_update",
+                "event_id": event_id,
+                "stage": "detected",
+            }))
+
         return {"forwarded": True, "forward_error": None}
 
     except Exception as exc:

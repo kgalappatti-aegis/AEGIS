@@ -110,10 +110,11 @@ async function fetchMatrix() {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function AttackMatrix({ wsRef }) {
-  const [data, setData]           = useState(null);      // { techniques: {}, lastUpdated }
+  const [data, setData]           = useState(null);      // { techniques: {}, lastUpdated, infraProfile }
   const [actor, setActor]         = useState('All');
   const [viewMode, setViewMode]   = useState('heatmap'); // heatmap | list
   const [selected, setSelected]   = useState(null);      // technique id
+  const [activePlatforms, setActivePlatforms] = useState(null); // null = not initialized, Set = active platforms
   const [loading, setLoading]     = useState(true);
   const mountedRef                = useRef(true);
 
@@ -123,6 +124,10 @@ export default function AttackMatrix({ wsRef }) {
     fetchMatrix().then(d => {
       if (mountedRef.current) {
         setData(d);
+        // Initialize all platforms as active
+        if (d?.infraProfile?.length) {
+          setActivePlatforms(new Set(d.infraProfile));
+        }
         setLoading(false);
       }
     });
@@ -177,13 +182,41 @@ export default function AttackMatrix({ wsRef }) {
     for (const a of (t.actors || [])) apiActors.add(a);
   }
 
-  // Filter by actor
-  const filteredTechs = actor === 'All'
-    ? allTechniques
-    : allTechniques.filter(t => {
-        const entry = techniques[t.id];
-        return entry?.actors?.includes(actor);
-      });
+  // Infrastructure profile from API
+  const infraProfile = data?.infraProfile || [];
+  const infraProfileSet = new Set(infraProfile);
+  const hasInfraProfile = infraProfile.length > 0;
+  const allPlatformsActive = activePlatforms != null && infraProfile.every(p => activePlatforms.has(p));
+  const anyPlatformOff = activePlatforms != null && !allPlatformsActive;
+
+  // Toggle a single platform on/off
+  const togglePlatform = (platform) => {
+    setActivePlatforms(prev => {
+      const next = new Set(prev);
+      if (next.has(platform)) next.delete(platform);
+      else next.add(platform);
+      return next;
+    });
+  };
+
+  // Check if a technique is relevant to the currently active platforms
+  const isInfraRelevant = (techId) => {
+    if (!hasInfraProfile || activePlatforms == null) return true;
+    const entry = techniques[techId];
+    const platforms = entry?.platforms || [];
+    if (platforms.length === 0) return true; // unknown = relevant
+    return platforms.some(p => activePlatforms.has(p));
+  };
+
+  // Filter by actor; hide non-relevant when any platform is toggled off
+  const filteredTechs = allTechniques.filter(t => {
+    if (actor !== 'All') {
+      const entry = techniques[t.id];
+      if (!entry?.actors?.includes(actor)) return false;
+    }
+    if (anyPlatformOff && !isInfraRelevant(t.id)) return false;
+    return true;
+  });
 
   // Group by tactic
   const byTactic = {};
@@ -259,6 +292,37 @@ export default function AttackMatrix({ wsRef }) {
           ))}
         </div>
 
+        {/* Infrastructure platform toggles */}
+        {hasInfraProfile && activePlatforms != null && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ color: C.muted, fontSize: 10, letterSpacing: '0.08em', marginRight: 4 }}>INFRA</span>
+            {[...infraProfile].sort().map(p => {
+              const active = activePlatforms.has(p);
+              return (
+                <button
+                  key={p}
+                  onClick={() => togglePlatform(p)}
+                  style={{
+                    background: active ? `${C.green}1a` : 'transparent',
+                    border: `1px solid ${active ? C.green : C.border}`,
+                    color: active ? C.green : `${C.muted}66`,
+                    fontSize: 9,
+                    fontWeight: 600,
+                    padding: '3px 8px',
+                    borderRadius: 3,
+                    cursor: 'pointer',
+                    letterSpacing: '0.03em',
+                    transition: 'all 0.15s',
+                    textDecoration: active ? 'none' : 'line-through',
+                  }}
+                >
+                  {p}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {/* Stats */}
         <div style={{ display: 'flex', gap: 20, marginLeft: 'auto' }}>
           <StatMini label="TOTAL HITS" value={totalHits} color={C.teal} />
@@ -266,6 +330,13 @@ export default function AttackMatrix({ wsRef }) {
           <StatMini label="TACTICS HIT" value={`${coveredTactics}/14`} color={C.purple} />
         </div>
       </div>
+
+      {/* Filtered technique count when platforms are toggled off */}
+      {anyPlatformOff && (
+        <div style={{ marginBottom: 10, color: C.muted, fontSize: 10 }}>
+          Showing {filteredTechs.length} techniques relevant to {[...activePlatforms].sort().join(', ')}
+        </div>
+      )}
 
       {loading ? (
         <div style={{
@@ -303,6 +374,7 @@ export default function AttackMatrix({ wsRef }) {
             <DetailPanel
               tech={selectedTech}
               onClose={() => setSelected(null)}
+              infraProfile={infraProfileSet}
             />
           )}
         </div>
@@ -459,7 +531,7 @@ function ListView({ byTactic, techniques, maxHits, selected, onSelect }) {
       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr>
-            {['TTP ID', 'NAME', 'TACTIC', 'HITS', 'PRIORITY', 'ACTORS'].map(h => (
+            {['TTP ID', 'NAME', 'TACTIC', 'HITS', 'PRIORITY', 'ACTORS', 'PLATFORMS'].map(h => (
               <th key={h} style={thStyle}>{h}</th>
             ))}
           </tr>
@@ -467,7 +539,7 @@ function ListView({ byTactic, techniques, maxHits, selected, onSelect }) {
         <tbody>
           {allTechs.length === 0 ? (
             <tr>
-              <td colSpan={6} style={{
+              <td colSpan={7} style={{
                 padding: 28,
                 textAlign: 'center',
                 color: C.muted,
@@ -491,6 +563,7 @@ function ListView({ byTactic, techniques, maxHits, selected, onSelect }) {
                 background: isSelected ? `${C.teal}11` : 'transparent',
                 ...extra,
               });
+              const platforms = tech.platforms || [];
               return (
                 <tr
                   key={tech.id}
@@ -513,6 +586,9 @@ function ListView({ byTactic, techniques, maxHits, selected, onSelect }) {
                   <td style={td({ color: C.purple, fontSize: 10 })}>
                     {(tech.actors || []).join(', ') || '---'}
                   </td>
+                  <td style={td({ color: C.muted, fontSize: 10 })}>
+                    {platforms.length > 0 ? platforms.join(', ') : '---'}
+                  </td>
                 </tr>
               );
             })
@@ -525,9 +601,12 @@ function ListView({ byTactic, techniques, maxHits, selected, onSelect }) {
 
 // ── Detail panel ─────────────────────────────────────────────────────────────
 
-function DetailPanel({ tech, onClose }) {
+function DetailPanel({ tech, onClose, infraProfile }) {
   const hits = tech.hits || 0;
   const actors = tech.actors || [];
+  const platforms = tech.platforms || [];
+  const hasInfra = infraProfile && infraProfile.size > 0;
+  const relevant = !hasInfra || platforms.length === 0 || platforms.some(p => infraProfile.has(p));
 
   return (
     <div style={{
@@ -617,6 +696,42 @@ function DetailPanel({ tech, onClose }) {
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Platforms */}
+      {platforms.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ color: C.muted, fontSize: 9, letterSpacing: '0.1em', marginBottom: 6 }}>
+            PLATFORMS
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {platforms.map(p => {
+              const match = hasInfra && infraProfile.has(p);
+              return (
+                <span key={p} style={{
+                  padding: '2px 8px',
+                  background: match ? 'rgba(52,211,153,0.12)' : 'rgba(90,114,148,0.12)',
+                  color: match ? C.green : C.muted,
+                  border: `1px solid ${match ? 'rgba(52,211,153,0.3)' : 'rgba(90,114,148,0.2)'}`,
+                  borderRadius: 3,
+                  fontSize: 10,
+                }}>
+                  {p}
+                </span>
+              );
+            })}
+          </div>
+          {hasInfra && (
+            <div style={{
+              marginTop: 6,
+              fontSize: 10,
+              color: relevant ? C.green : C.muted,
+              fontWeight: 600,
+            }}>
+              {relevant ? 'Relevant to your infrastructure' : 'Not relevant to your infrastructure'}
+            </div>
+          )}
         </div>
       )}
 

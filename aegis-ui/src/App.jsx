@@ -16,6 +16,7 @@ import KillChainFlow from './components/KillChainFlow';
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 const MAX_EVENTS     = 100;
 const MAX_ADVISORIES = 100;
+const MAX_INBOUND    = 200;
 const RECONNECT_MS   = 3_000;
 const FLASH_MS       = 700;
 
@@ -61,6 +62,7 @@ const TLP_STYLE = {
 
 const STAGE_CFG = {
   ingested:  { color: C.muted,  label: 'INGESTED'  },
+  routed:    { color: C.blue,   label: 'ROUTED'    },
   triaged:   { color: C.orange, label: 'TRIAGED'   },
   simulated: { color: C.purple, label: 'SIMULATED' },
   detected:  { color: C.teal,   label: 'DETECTED'  },
@@ -181,6 +183,7 @@ function AdvisoryCard({ adv, isNew }) {
   const [sigma,  setSigma]  = useState(false);
   const [gaps,   setGaps]   = useState(false);
   const [chain,  setChain]  = useState(false);
+  const [artExp, setArtExp] = useState(false);
 
   const borderColor = C[adv.priority] || C.muted;
 
@@ -189,6 +192,7 @@ function AdvisoryCard({ adv, isNew }) {
   const immActions  = (Array.isArray(adv.immediate_actions)  ? adv.immediate_actions  : []).slice(0, 3);
   const detActions  = (Array.isArray(adv.detection_actions)  ? adv.detection_actions  : []).slice(0, 3);
   const mitreTechs  = Array.isArray(adv.mitre_techniques)    ? adv.mitre_techniques   : [];
+  const valTests    = Array.isArray(adv.validation_tests)    ? adv.validation_tests   : [];
 
   return (
     <div
@@ -312,6 +316,15 @@ function AdvisoryCard({ adv, isNew }) {
             onClick={() => setGaps(v => !v)}
           />
         )}
+        {valTests.length > 0 && (
+          <ExpandToggle
+            label="VALIDATION TESTS"
+            count={valTests.length}
+            expanded={artExp}
+            color={C.blue}
+            onClick={() => setArtExp(v => !v)}
+          />
+        )}
       </div>
 
       {chain && adv.event_id && (
@@ -326,6 +339,10 @@ function AdvisoryCard({ adv, isNew }) {
 
       {gaps && covGaps.length > 0 && (
         <GapsSection gaps={covGaps} />
+      )}
+
+      {artExp && valTests.length > 0 && (
+        <ValidationTestsSection tests={valTests} />
       )}
 
       {/* ── MITRE technique pills ──────────────────────────────────────── */}
@@ -470,6 +487,108 @@ function GapsSection({ gaps }) {
   );
 }
 
+function ValidationTestsSection({ tests }) {
+  // Group tests by technique_id
+  const byTechnique = {};
+  for (const t of tests) {
+    const tid = t.technique_id || 'unknown';
+    if (!byTechnique[tid]) byTechnique[tid] = [];
+    byTechnique[tid].push(t);
+  }
+
+  return (
+    <div style={{
+      borderLeft: `2px solid rgba(74,158,255,0.25)`,
+      paddingLeft: 12,
+      marginBottom: 10,
+    }}>
+      {Object.entries(byTechnique).map(([tid, group]) => (
+        <div key={tid} style={{ marginBottom: 10 }}>
+          <div style={{
+            color: C.blue,
+            fontSize: 11,
+            fontWeight: 700,
+            marginBottom: 6,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+          }}>
+            <span style={{
+              padding: '1px 7px',
+              background: 'rgba(74,158,255,0.12)',
+              border: '1px solid rgba(74,158,255,0.3)',
+              borderRadius: 3,
+              fontSize: 10,
+            }}>
+              {tid}
+            </span>
+            <span style={{ color: C.muted, fontWeight: 400, fontSize: 10 }}>
+              {group.length} test{group.length > 1 ? 's' : ''}
+            </span>
+          </div>
+          {group.map((t, i) => (
+            <div key={i} style={{
+              padding: '8px 10px',
+              marginBottom: 4,
+              background: 'rgba(74,158,255,0.04)',
+              borderRadius: 4,
+            }}>
+              <div style={{
+                color: C.textBright,
+                fontSize: 11,
+                fontWeight: 600,
+                marginBottom: 4,
+              }}>
+                {t.name || `Test ${i + 1}`}
+              </div>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+                {t.executor && (
+                  <span style={{
+                    color: C.muted,
+                    fontSize: 10,
+                    padding: '1px 6px',
+                    background: C.surface,
+                    borderRadius: 2,
+                    border: `1px solid ${C.border}`,
+                  }}>
+                    {t.executor}
+                  </span>
+                )}
+                {t.platforms && (
+                  <span style={{ color: C.muted, fontSize: 10 }}>
+                    {Array.isArray(t.platforms) ? t.platforms.join(', ') : t.platforms}
+                  </span>
+                )}
+                {t.auto_generated_guid && (
+                  <span style={{ color: C.muted, fontSize: 9, fontFamily: 'monospace' }}>
+                    {t.auto_generated_guid}
+                  </span>
+                )}
+              </div>
+              {t.github_url && (
+                <a
+                  href={t.github_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    color: C.blue,
+                    fontSize: 10,
+                    textDecoration: 'none',
+                    marginTop: 4,
+                    display: 'inline-block',
+                  }}
+                >
+                  View on GitHub ↗
+                </a>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── Event table row ───────────────────────────────────────────────────────────
 
 function EventRow({ ev, isNew, isSelected, onClick }) {
@@ -509,6 +628,211 @@ function EventRow({ ev, isNew, isSelected, onClick }) {
         {ev.routing_target || '—'}
       </td>
     </tr>
+  );
+}
+
+// ── Ingestion view ────────────────────────────────────────────────────────────
+
+function MiniBar({ label, value, max, color }) {
+  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+        <span style={{ color: C.muted, fontSize: 10, letterSpacing: '0.06em' }}>{label}</span>
+        <span style={{ color, fontSize: 11, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
+          {value.toLocaleString()}
+        </span>
+      </div>
+      <div style={{ height: 6, background: `${color}15`, borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{
+          height: '100%',
+          width: `${pct}%`,
+          background: color,
+          borderRadius: 3,
+          transition: 'width 0.4s ease',
+        }} />
+      </div>
+    </div>
+  );
+}
+
+function IngestionView({ inbound, stats, newIds, stages }) {
+  const [filter, setFilter] = useState('all');
+
+  const s = stats || {};
+  const bp = s.by_priority || {};
+  const br = s.by_routing || {};
+  const total = (bp.P0 || 0) + (bp.P1 || 0) + (bp.P2 || 0) + (bp.P3 || 0) || 1;
+  const routingTotal = Object.values(br).reduce((a, b) => a + b, 0) || 1;
+
+  const filtered = filter === 'all' ? inbound : inbound.filter(e => e.priority === filter);
+
+  const filterBtnStyle = (f) => {
+    const active = filter === f;
+    const color  = f === 'all' ? C.teal : (C[f] || C.teal);
+    return {
+      background: active ? `${color}1a` : 'transparent',
+      border: `1px solid ${active ? color : C.border}`,
+      color: active ? color : C.muted,
+      fontSize: 11,
+      fontWeight: 600,
+      padding: '3px 11px',
+      borderRadius: 3,
+      letterSpacing: '0.05em',
+      transition: 'all 0.15s',
+    };
+  };
+
+  const thStyle = {
+    padding: '8px 13px',
+    textAlign: 'left',
+    color: C.muted,
+    fontSize: 9,
+    fontWeight: 600,
+    letterSpacing: '0.1em',
+    borderBottom: `1px solid ${C.border}`,
+    background: C.card,
+    whiteSpace: 'nowrap',
+  };
+
+  const td = (extra = {}) => ({
+    padding: '7px 13px',
+    fontSize: 11,
+    color: C.text,
+    borderBottom: `1px solid ${C.border}44`,
+    whiteSpace: 'nowrap',
+    ...extra,
+  });
+
+  return (
+    <div>
+      {/* ── Charts row ──────────────────────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        {/* Priority distribution */}
+        <div style={{
+          background: C.surface,
+          border: `1px solid ${C.border}`,
+          borderRadius: 6,
+          padding: 16,
+        }}>
+          <div style={{ color: C.muted, fontSize: 9, fontWeight: 600, letterSpacing: '0.1em', marginBottom: 12 }}>
+            PRIORITY DISTRIBUTION
+          </div>
+          {[
+            { label: 'P0 — CRITICAL', value: bp.P0 || 0, color: C.P0 },
+            { label: 'P1 — HIGH',     value: bp.P1 || 0, color: C.P1 },
+            { label: 'P2 — MEDIUM',   value: bp.P2 || 0, color: C.P2 },
+            { label: 'P3 — LOW',      value: bp.P3 || 0, color: C.P3 },
+          ].map(p => (
+            <MiniBar key={p.label} {...p} max={total} />
+          ))}
+        </div>
+
+        {/* Routing targets */}
+        <div style={{
+          background: C.surface,
+          border: `1px solid ${C.border}`,
+          borderRadius: 6,
+          padding: 16,
+        }}>
+          <div style={{ color: C.muted, fontSize: 9, fontWeight: 600, letterSpacing: '0.1em', marginBottom: 12 }}>
+            ROUTING TARGETS
+          </div>
+          {Object.keys(br).length === 0 ? (
+            <div style={{ color: C.muted, fontSize: 11, padding: 12 }}>No routing data yet</div>
+          ) : (
+            Object.entries(br).sort((a, b) => b[1] - a[1]).map(([target, count]) => (
+              <MiniBar
+                key={target}
+                label={target.toUpperCase()}
+                value={count}
+                max={routingTotal}
+                color={ROUTING_COLOR[target] || C.muted}
+              />
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* ── Filter bar ──────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center' }}>
+        <span style={{ color: C.muted, fontSize: 10, marginRight: 4, letterSpacing: '0.08em' }}>
+          FILTER
+        </span>
+        {['all', 'P0', 'P1', 'P2', 'P3'].map(f => (
+          <button key={f} onClick={() => setFilter(f)} style={filterBtnStyle(f)}>
+            {f.toUpperCase()}
+          </button>
+        ))}
+        <span style={{ color: C.muted, fontSize: 10, marginLeft: 8 }}>
+          {filtered.length.toLocaleString()} events
+        </span>
+      </div>
+
+      {/* ── Table ───────────────────────────────────────────────────────── */}
+      <div style={{
+        background: C.surface,
+        border: `1px solid ${C.border}`,
+        borderRadius: 6,
+        overflow: 'hidden',
+      }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr>
+              {['TIME', 'EVENT ID', 'CVE / SOURCE', 'PRIORITY', 'STAGE', 'ROUTING', 'RELEVANCE', 'DESCRIPTION'].map(h => (
+                <th key={h} style={thStyle}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 ? (
+              <tr>
+                <td colSpan={8} style={{
+                  padding: 28,
+                  textAlign: 'center',
+                  color: C.muted,
+                  fontSize: 12,
+                }}>
+                  Waiting for inbound events…
+                </td>
+              </tr>
+            ) : (
+              filtered.map(ev => {
+                const routingColor = ROUTING_COLOR[ev.routing_target] || C.muted;
+                return (
+                  <tr
+                    key={ev._uid}
+                    className={newIds.has(ev._uid) ? 'row-new' : ''}
+                    style={{ transition: 'background 0.12s' }}
+                  >
+                    <td style={td({ color: C.muted })}>{fmtTime(ev.ts || ev.ingested_at)}</td>
+                    <td style={td({ color: C.teal, fontFamily: 'inherit' })}>{shortId(ev.event_id)}</td>
+                    <td style={td({ color: C.amber })}>{ev.cve_id || ev.source_type || '—'}</td>
+                    <td style={td()}><PriorityPill priority={ev.priority} /></td>
+                    <td style={td()}><StagePill stage={stages[ev.event_id] || 'ingested'} /></td>
+                    <td style={td({ color: routingColor })}>{ev.routing_target || '—'}</td>
+                    <td style={td({
+                      color: ev.relevance_score != null ? C.teal : C.muted,
+                      fontVariantNumeric: 'tabular-nums',
+                    })}>
+                      {ev.relevance_score != null ? parseFloat(ev.relevance_score).toFixed(3) : '—'}
+                    </td>
+                    <td style={td({
+                      color: C.muted,
+                      maxWidth: 260,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    })}>
+                      {ev.description || '—'}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -696,13 +1020,77 @@ function EventsView({ events, newIds }) {
 // ── Advisories view ───────────────────────────────────────────────────────────
 
 function AdvisoriesView({ advisories, newIds }) {
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+
+  const searchLower = search.toLowerCase().trim();
+
+  const filtered = advisories.filter(adv => {
+    if (filter !== 'all' && adv.priority !== filter) return false;
+    if (searchLower) {
+      const title = (adv.title || '').toLowerCase();
+      const cve   = (adv.cve_id || '').toLowerCase();
+      if (!title.includes(searchLower) && !cve.includes(searchLower)) return false;
+    }
+    return true;
+  });
+
+  const filterBtnStyle = (f) => {
+    const active = filter === f;
+    const color  = f === 'all' ? C.teal : (C[f] || C.teal);
+    return {
+      background: active ? `${color}1a` : 'transparent',
+      border: `1px solid ${active ? color : C.border}`,
+      color: active ? color : C.muted,
+      fontSize: 11,
+      fontWeight: 600,
+      padding: '3px 11px',
+      borderRadius: 3,
+      letterSpacing: '0.05em',
+      transition: 'all 0.15s',
+    };
+  };
+
   return (
     <div>
-      <div style={{ color: C.muted, fontSize: 10, letterSpacing: '0.08em', marginBottom: 12 }}>
-        {advisories.length} ADVISORIES RECEIVED
+      {/* Filter + search bar */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ color: C.muted, fontSize: 10, marginRight: 4, letterSpacing: '0.08em' }}>
+          FILTER
+        </span>
+        {['all', 'P0', 'P1', 'P2', 'P3'].map(f => (
+          <button key={f} onClick={() => setFilter(f)} style={filterBtnStyle(f)}>
+            {f.toUpperCase()}
+          </button>
+        ))}
+
+        <input
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search title or CVE…"
+          style={{
+            marginLeft: 'auto',
+            background: C.surface,
+            border: `1px solid ${C.border}`,
+            borderRadius: 4,
+            color: C.text,
+            fontSize: 11,
+            padding: '5px 12px',
+            width: 220,
+            outline: 'none',
+            transition: 'border-color 0.15s',
+          }}
+          onFocus={e => { e.target.style.borderColor = C.teal; }}
+          onBlur={e => { e.target.style.borderColor = C.border; }}
+        />
+
+        <span style={{ color: C.muted, fontSize: 10 }}>
+          {filtered.length} of {advisories.length}
+        </span>
       </div>
 
-      {advisories.length === 0 ? (
+      {filtered.length === 0 ? (
         <div style={{
           background: C.surface,
           border: `1px solid ${C.border}`,
@@ -713,11 +1101,13 @@ function AdvisoriesView({ advisories, newIds }) {
           fontSize: 12,
           lineHeight: 1.8,
         }}>
-          No advisories yet.<br />
-          They will appear here as events complete the full pipeline.
+          {advisories.length === 0
+            ? <>No advisories yet.<br />They will appear here as events complete the full pipeline.</>
+            : 'No advisories match the current filter.'
+          }
         </div>
       ) : (
-        advisories.map(adv => (
+        filtered.map(adv => (
           <AdvisoryCard
             key={adv._uid}
             adv={adv}
@@ -792,6 +1182,7 @@ function TabBar({ activeTab, onSwitch, unread }) {
       padding: '0 24px',
     }}>
       {[
+        { id: 'ingestion',  label: 'INGESTION'  },
         { id: 'events',     label: 'EVENTS'     },
         { id: 'advisories', label: 'ADVISORIES' },
         { id: 'attack',     label: 'ATT&CK'     },
@@ -894,13 +1285,16 @@ function Header({ wsStatus }) {
 
 export default function App() {
   const [wsStatus,   setWsStatus]   = useState('connecting');
-  const [activeTab,  setActiveTab]  = useState('events');
+  const [activeTab,  setActiveTab]  = useState('ingestion');
   const [unread,     setUnread]     = useState(0);
   const [events,     setEvents]     = useState([]);
   const [advisories, setAdvisories] = useState([]);
+  const [inbound,    setInbound]    = useState([]);
   const [newEvIds,   setNewEvIds]   = useState(new Set());
   const [newAdvIds,  setNewAdvIds]  = useState(new Set());
+  const [newInbIds,  setNewInbIds]  = useState(new Set());
   const [stats,      setStats]      = useState(null);
+  const [stages,     setStages]     = useState({});       // event_id → stage
 
   const wsRef        = useRef(null);
   const retryRef     = useRef(null);
@@ -931,10 +1325,20 @@ export default function App() {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
 
-      if (msg.type === 'event') {
+      if (msg.type === 'ingestion') {
+        const ev = { ...msg.payload, ts: msg.ts, _uid: uid() };
+        setInbound(prev => {
+          const eid = ev.event_id;
+          if (eid && prev.some(e => e.event_id === eid)) {
+            return prev.map(e => e.event_id === eid ? { ...ev, _uid: e._uid } : e);
+          }
+          return [ev, ...prev].slice(0, MAX_INBOUND);
+        });
+        flash(setNewInbIds, ev._uid);
+
+      } else if (msg.type === 'event') {
         const ev = { ...msg.payload, ts: msg.ts, _uid: uid() };
         setEvents(prev => {
-          // Deduplicate by event_id — update existing or prepend new
           const eid = ev.event_id;
           if (eid && prev.some(e => e.event_id === eid)) {
             return prev.map(e => e.event_id === eid ? { ...ev, _uid: e._uid } : e);
@@ -945,6 +1349,14 @@ export default function App() {
 
       } else if (msg.type === 'stats') {
         setStats(msg.payload);
+
+      } else if (msg.type === 'stage_update') {
+        const { event_id, stage } = msg.payload;
+        if (event_id) setStages(prev => ({ ...prev, [event_id]: stage }));
+
+      } else if (msg.type === 'stages') {
+        // Bulk stage catchup on reconnect
+        setStages(prev => ({ ...prev, ...msg.payload }));
 
       } else if (msg.type === 'advisory') {
         const adv = { ...msg.payload, ts: msg.ts, _uid: uid() };
@@ -983,6 +1395,9 @@ export default function App() {
       <StatBar stats={stats} advisoryCount={advisories.length} />
 
       <div style={{ padding: '16px 24px', maxWidth: 1600, margin: '0 auto' }}>
+        {activeTab === 'ingestion' && (
+          <IngestionView inbound={inbound} stats={stats} newIds={newInbIds} stages={stages} />
+        )}
         {activeTab === 'events' && (
           <EventsView events={events} newIds={newEvIds} />
         )}

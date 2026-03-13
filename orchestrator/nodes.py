@@ -118,6 +118,17 @@ async def dispatch(state: OrchestratorState, redis: aioredis.Redis) -> Orchestra
             dispatch_key,
             msg_id,
         )
+
+        # Publish stage update for live UI tracking
+        event_id = state.get("event_id", "")
+        if event_id:
+            await redis.hset("aegis:event:stages", event_id, "routed")
+            await redis.publish("aegis:broadcast", json.dumps({
+                "type": "stage_update",
+                "event_id": event_id,
+                "stage": "routed",
+            }))
+
         return {"dispatched": True, "dispatch_error": None}
     except Exception as exc:  # noqa: BLE001
         logger.error("Dispatch failed for event %s: %s", state.get("event_id"), exc)

@@ -49,9 +49,10 @@ class DetectionState(TypedDict, total=False):
     skip_reason: str
 
     # ── After generate_detections ────────────────────────────────────────────
-    sigma_rules:    list[str]   # YAML strings, one per rule
-    coverage_gaps:  list[str]   # human-readable gap descriptions
-    detection_summary: str      # one-paragraph analyst summary
+    sigma_rules:      list[str]            # YAML strings, one per rule
+    coverage_gaps:    list[str]            # human-readable gap descriptions
+    detection_summary: str                 # one-paragraph analyst summary
+    validation_tests: list[dict[str, Any]] # Atomic Red Team tests for validation
 
     # ── After forward_to_advisory ────────────────────────────────────────────
     forwarded:     bool

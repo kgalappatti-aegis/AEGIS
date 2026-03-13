@@ -35,6 +35,7 @@ Guarantees
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import pathlib
 import signal
@@ -264,6 +265,15 @@ async def _process_message(
     # --- 6. Forward ------------------------------------------------------
     stream_data = enriched.to_redis_stream()
     await redis.xadd(dest_key, stream_data, maxlen=50_000, approximate=True)
+
+    # Publish stage update for live UI tracking
+    if enriched.event_id:
+        await redis.hset("aegis:event:stages", enriched.event_id, "triaged")
+        await redis.publish("aegis:broadcast", json.dumps({
+            "type": "stage_update",
+            "event_id": enriched.event_id,
+            "stage": "triaged",
+        }))
 
     epss_str = f"EPSS={enrichment.epss_score:.4f}" if enrichment.epss_score is not None else "EPSS=n/a"
     kev_str = "KEV=YES" if enrichment.in_kev else "KEV=no"

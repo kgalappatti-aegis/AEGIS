@@ -23,5 +23,8 @@ Thumbs.db
 .idea/
 *.swp
 
+# MISP Docker (cloned external repo)
+misp-docker/
+
 # Claude Code
 .claude/

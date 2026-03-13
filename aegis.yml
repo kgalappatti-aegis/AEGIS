@@ -69,6 +69,29 @@ services:
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-300}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
+  # ── MISP Ingestion Agent ──────────────────────────────────────────────────
+  # Polls a MISP instance for threat intel events, normalizes them to AEGIS
+  # event schema, deduplicates by UUID, and publishes to inbound stream.
+  misp:
+    build:
+      context: ./misp
+      dockerfile: Dockerfile
+    container_name: aegis-misp
+    restart: on-failure
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      MISP_URL: ${MISP_URL:-https://localhost}
+      MISP_API_KEY: ${MISP_API_KEY:-}
+      MISP_VERIFY_SSL: ${MISP_VERIFY_SSL:-false}
+      MISP_POLL_INTERVAL_SECONDS: ${MISP_POLL_INTERVAL_SECONDS:-300}
+      MISP_PAGE_LIMIT: ${MISP_PAGE_LIMIT:-100}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
   # ── Triage Agent ──────────────────────────────────────────────────────────
   # Build context is the repo root so orchestrator/schema.py can be copied in.
   triage:
@@ -111,6 +134,43 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
     entrypoint: ["python", "mitre_loader.py"]
+
+  # ── Atomic Red Team Loader ────────────────────────────────────────────────
+  # One-shot: downloads the Atomic Red Team index and loads test metadata
+  # into Redis for use by the detection agent.
+  # Trigger manually:  docker compose run --rm atomic-loader
+  atomic-loader:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.atomic
+    container_name: aegis-atomic-loader
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+    entrypoint: ["python", "atomic_loader.py"]
+
+  # ── Test Harness ─────────────────────────────────────────────────────────
+  # On-demand: inject test/demo data into the pipeline.
+  # Usage:  docker compose run --rm harness demo
+  #         docker compose run --rm harness scenario --name apt29-intrusion
+  #         docker compose run --rm harness smoke
+  #         docker compose run --rm harness status
+  harness:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.harness
+    container_name: aegis-harness
+    restart: "no"
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
 
   # ── Neo4j ────────────────────────────────────────────────────────────────
   neo4j:

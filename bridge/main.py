@@ -1,7 +1,10 @@
 """
 AEGIS WebSocket Bridge
 
-Two background tasks push data to all connected WebSocket clients:
+Background tasks push data to all connected WebSocket clients:
+
+  _tail_inbound_loop    – XREAD-tails aegis:events:inbound and emits
+                          type:"ingestion" messages for the Ingestion tab.
 
   _tail_detection_loop  – XREAD-tails aegis:queue:detection and emits
                           type:"event" messages with stage:"detected".
@@ -10,13 +13,16 @@ Two background tasks push data to all connected WebSocket clients:
                           type:"advisory" messages published by the advisory
                           agent.
 
-Both tasks normalise their output into the envelope the UI expects:
-  { "type": "event"|"advisory", "payload": {...}, "ts": <epoch ms> }
+All tasks normalise their output into the envelope the UI expects:
+  { "type": "event"|"advisory"|"ingestion", "payload": {...}, "ts": <epoch ms> }
 
 Endpoints
 ---------
-GET  /ws       WebSocket — live event + advisory push
-GET  /healthz  Liveness probe
+GET  /ws                    WebSocket — live event + advisory + ingestion push
+GET  /api/events/inbound    Recent inbound events (XREVRANGE)
+GET  /api/attack-matrix     TTP hit counts
+GET  /api/simulation/:id    Simulation finding
+GET  /healthz               Liveness probe
 """
 
 from __future__ import annotations
@@ -122,6 +128,87 @@ def _decode(raw: dict[bytes | str, bytes | str]) -> dict[str, str]:
 
 def _envelope(msg_type: str, payload: dict) -> str:
     return json.dumps({"type": msg_type, "payload": payload, "ts": _now_ms()})
+
+
+# ---------------------------------------------------------------------------
+# Task 0: tail aegis:events:inbound (Ingestion tab)
+# ---------------------------------------------------------------------------
+
+def _decode_inbound_event(raw_id: bytes | str, raw_fields: dict) -> dict:
+    """Flatten raw inbound event into a JSON-serialisable dict for the UI."""
+    decoded: dict[str, str] = _decode(raw_fields)
+
+    sid = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+    decoded["stream_id"] = sid
+
+    raw_payload_str = decoded.get("raw_payload", "{}")
+    try:
+        payload = json.loads(raw_payload_str)
+        decoded["cve_id"] = payload.get("cve_id") or payload.get("id")
+        decoded["vuln_status"] = payload.get("vulnStatus")
+        descriptions = payload.get("descriptions", [])
+        en = next((d["value"] for d in descriptions if d.get("lang") == "en"), None)
+        decoded["description"] = (en[:120] + "…") if en and len(en) > 120 else en
+        # MISP events
+        if not decoded.get("description") and payload.get("info"):
+            decoded["description"] = str(payload["info"])[:120]
+    except (json.JSONDecodeError, TypeError):
+        decoded["cve_id"] = None
+        decoded["description"] = None
+        decoded["vuln_status"] = None
+
+    decoded.pop("raw_payload", None)
+
+    for key in ("relevance_score", "infrastructure_match",
+                "exploitability", "temporal_urgency"):
+        if key in decoded:
+            try:
+                decoded[key] = float(decoded[key])
+            except (ValueError, TypeError):
+                decoded[key] = None
+
+    return decoded
+
+
+async def _tail_inbound_loop(redis: aioredis.Redis) -> None:
+    """
+    XREAD-tail ``aegis:events:inbound`` and push each new entry to all
+    WebSocket clients as a type:"ingestion" message for the Ingestion tab.
+    """
+    last_id = "$"
+    logger.info("Inbound tail started. Stream: '%s'", INBOUND_STREAM)
+
+    try:
+        while True:
+            try:
+                results = await redis.xread(
+                    {INBOUND_STREAM: last_id}, block=2_000, count=20
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("XREAD error on inbound stream: %s", exc)
+                await asyncio.sleep(2)
+                continue
+
+            if not results:
+                continue
+
+            for _stream, messages in results:
+                for raw_id, raw_fields in messages:
+                    last_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+                    payload = _decode_inbound_event(raw_id, raw_fields)
+
+                    msg = _envelope("ingestion", payload)
+                    if manager.count:
+                        await manager.broadcast(msg)
+                        logger.debug(
+                            "Pushed inbound event %s to %d client(s).",
+                            payload.get("event_id", "?"), manager.count,
+                        )
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("Inbound tail stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +378,7 @@ async def _stats_loop(redis: aioredis.Redis) -> None:
 
                 # Sample recent inbound events for priority distribution
                 by_priority = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
+                by_routing: dict[str, int] = {}
                 relevance_scores = []
 
                 sample = await redis.xrevrange(INBOUND_STREAM, count=2000)
@@ -299,6 +387,9 @@ async def _stats_loop(redis: aioredis.Redis) -> None:
                     p = f.get("priority")
                     if p in by_priority:
                         by_priority[p] += 1
+                    r = f.get("routing_target")
+                    if r:
+                        by_routing[r] = by_routing.get(r, 0) + 1
 
                 # Relevance scores from triaged events
                 for queue in (SIMULATION_QUEUE, ADVISORY_QUEUE):
@@ -320,6 +411,7 @@ async def _stats_loop(redis: aioredis.Redis) -> None:
                 payload = {
                     "total_ingested": total_ingested,
                     "by_priority":    by_priority,
+                    "by_routing":     by_routing,
                     "avg_relevance":  avg_relevance,
                     "triaged_count":  len(relevance_scores),
                     "queue_depths": {
@@ -378,6 +470,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db_pool = None
     app.state.db_pool = db_pool
 
+    # Inbound tail needs its own connection (it blocks on XREAD independently)
+    redis_inbound = aioredis.from_url(
+        REDIS_URL,
+        encoding="utf-8",
+        decode_responses=False,
+        socket_keepalive=True,
+    )
+
+    inbound_task   = asyncio.create_task(_tail_inbound_loop(redis_inbound))
     tail_task      = asyncio.create_task(_tail_detection_loop(redis_stream))
     subscribe_task = asyncio.create_task(_subscribe_loop(redis_pubsub))
     stats_task     = asyncio.create_task(_stats_loop(redis_stream))
@@ -386,10 +487,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        inbound_task.cancel()
         tail_task.cancel()
         subscribe_task.cancel()
         stats_task.cancel()
-        await asyncio.gather(tail_task, subscribe_task, stats_task, return_exceptions=True)
+        await asyncio.gather(inbound_task, tail_task, subscribe_task, stats_task, return_exceptions=True)
+        await redis_inbound.aclose()
         await redis_stream.aclose()
         await redis_pubsub.aclose()
         await redis_api.aclose()
@@ -447,6 +550,16 @@ async def _send_catchup(ws: WebSocket, redis: aioredis.Redis) -> None:
     the persistent advisory stream so a newly connected UI has context.
     """
     try:
+        # Recent inbound events (for Ingestion tab)
+        raw_inbound = await redis.xrevrange(
+            INBOUND_STREAM, count=CATCHUP_LIMIT,
+        )
+        inbound = list(reversed(raw_inbound or []))
+
+        for raw_id, raw_fields in inbound:
+            payload = _decode_inbound_event(raw_id, raw_fields)
+            await ws.send_text(_envelope("ingestion", payload))
+
         # Recent detection events (newest first, reversed to chronological)
         raw_events = await redis.xrevrange(
             DETECTION_QUEUE, count=CATCHUP_LIMIT,
@@ -500,9 +613,14 @@ async def _send_catchup(ws: WebSocket, redis: aioredis.Redis) -> None:
             msg_type = data.pop("type", "advisory")
             await ws.send_text(_envelope(msg_type, data))
 
+        # Send cached event stages for the ingestion tab
+        stages = await redis.hgetall("aegis:event:stages")
+        if stages:
+            await ws.send_text(_envelope("stages", stages))
+
         logger.info(
-            "Catchup sent: %d events, %d advisories to new client.",
-            len(events), len(advisories),
+            "Catchup sent: %d inbound, %d detection events, %d advisories, %d stages to new client.",
+            len(inbound), len(events), len(advisories), len(stages),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Catchup failed: %s — client will only see live data.", exc)
@@ -511,6 +629,39 @@ async def _send_catchup(ws: WebSocket, redis: aioredis.Redis) -> None:
 # ---------------------------------------------------------------------------
 # REST API endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/api/events/inbound")
+async def get_inbound_events(limit: int = 200) -> list[dict]:
+    """Return the most recent *limit* events from the inbound stream."""
+    r: aioredis.Redis = app.state.redis_api
+    raw = await r.xrevrange(INBOUND_STREAM, count=min(limit, 500))
+    results = []
+    for raw_id, raw_fields in (raw or []):
+        # redis_api has decode_responses=True, so keys/values are already str
+        fields = dict(raw_fields)
+        sid = raw_id if isinstance(raw_id, str) else raw_id.decode()
+        fields["stream_id"] = sid
+
+        raw_payload_str = fields.get("raw_payload", "{}")
+        try:
+            payload = json.loads(raw_payload_str)
+            fields["cve_id"] = payload.get("cve_id") or payload.get("id")
+            fields["vuln_status"] = payload.get("vulnStatus")
+            descriptions = payload.get("descriptions", [])
+            en = next((d["value"] for d in descriptions if d.get("lang") == "en"), None)
+            fields["description"] = (en[:120] + "…") if en and len(en) > 120 else en
+            if not fields.get("description") and payload.get("info"):
+                fields["description"] = str(payload["info"])[:120]
+        except (json.JSONDecodeError, TypeError):
+            fields["cve_id"] = None
+            fields["description"] = None
+            fields["vuln_status"] = None
+
+        fields.pop("raw_payload", None)
+        results.append(fields)
+
+    return results
+
 
 @app.get("/api/attack-matrix")
 async def attack_matrix() -> dict:
@@ -525,21 +676,26 @@ async def attack_matrix() -> dict:
     """
     r: aioredis.Redis = app.state.redis_api
 
-    hits_raw, priority_raw, actors_raw, names_raw, tactics_raw, updated_at = (
+    (hits_raw, priority_raw, actors_raw, names_raw,
+     tactics_raw, platforms_raw, updated_at, infra_profile) = (
         await asyncio.gather(
             r.hgetall("aegis:ttp:hits"),
             r.hgetall("aegis:ttp:priority"),
             r.hgetall("aegis:ttp:actors"),
             r.hgetall("aegis:ttp:name"),
             r.hgetall("aegis:ttp:tactic"),
+            r.hgetall("aegis:ttp:platforms"),
             r.get("aegis:ttp:updated_at"),
+            r.smembers("aegis:infra:platforms"),
         )
     )
 
     techniques: dict[str, dict] = {}
-    all_ids = set(hits_raw) | set(priority_raw) | set(actors_raw) | set(names_raw) | set(tactics_raw)
+    all_ids = (set(hits_raw) | set(priority_raw) | set(actors_raw)
+               | set(names_raw) | set(tactics_raw) | set(platforms_raw))
     for tid in all_ids:
         hit_val = hits_raw.get(tid)
+        plat_str = platforms_raw.get(tid, "")
         techniques[tid] = {
             "hits": int(hit_val) if hit_val else 0,
             "maxPriority": priority_raw.get(tid) or None,
@@ -550,11 +706,13 @@ async def attack_matrix() -> dict:
             ],
             "name": names_raw.get(tid) or None,
             "tactic": tactics_raw.get(tid) or None,
+            "platforms": [p.strip() for p in plat_str.split(",") if p.strip()] if plat_str else [],
         }
 
     return {
         "techniques": techniques,
         "lastUpdated": updated_at or None,
+        "infraProfile": sorted(infra_profile) if infra_profile else [],
     }
 
 

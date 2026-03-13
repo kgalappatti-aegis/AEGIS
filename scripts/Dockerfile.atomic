@@ -1,0 +1,14 @@
+# One-shot Atomic Red Team loader
+# Downloads the ART index from GitHub and populates Redis
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir httpx pyyaml redis python-dotenv
+
+COPY atomic_loader.py .
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "atomic_loader.py"]

@@ -32,6 +32,7 @@ class SourceType(str, Enum):
     THREATFOX = "threatfox"  # Abuse.ch ThreatFox IOC feed
     EDR       = "edr"        # Endpoint Detection & Response telemetry
     SIEM      = "siem"       # SIEM correlation rule hit
+    MISP      = "misp"       # MISP threat intelligence platform
 
 
 class Priority(str, Enum):

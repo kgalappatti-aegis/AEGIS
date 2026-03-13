@@ -136,6 +136,7 @@ async def load_event(state: AdvisoryState) -> dict[str, Any]:
         # Detection output
         "sigma_rules":              _json_list(fields, "sigma_rules"),
         "coverage_gaps":            _json_list(fields, "coverage_gaps"),
+        "validation_tests":         _json_list(fields, "validation_tests"),
         "detection_summary":        fields.get("detection_summary", ""),
         "detected_at":              fields.get("detected_at", ""),
         "skip":        False,
@@ -205,6 +206,11 @@ async def generate_advisory(
             "detection_summary": state.get("detection_summary", ""),
             "coverage_gaps":     state.get("coverage_gaps",     []),
             "sigma_rule_count":  len(state.get("sigma_rules", [])),
+            # Validation
+            "validation_tests":  [
+                {"technique_id": t.get("technique_id"), "name": t.get("name"), "executor": t.get("executor")}
+                for t in state.get("validation_tests", [])
+            ][:5],
         },
         "response_schema": _RESPONSE_SCHEMA,
     }, indent=2)
@@ -439,6 +445,7 @@ async def broadcast(
         "detection_actions": state.get("detection_actions", []),
         "sigma_rules":       state.get("sigma_rules",       []),
         "coverage_gaps":     state.get("coverage_gaps",     []),
+        "validation_tests":  state.get("validation_tests",  []),
         "affected_assets":   state.get("affected_assets",   []),
         "created_at":        datetime.now(timezone.utc).isoformat(),
     })
@@ -454,6 +461,16 @@ async def broadcast(
             maxlen=500,
             approximate=True,
         )
+
+        # Publish stage update for live UI tracking
+        event_id = state.get("event_id", "")
+        if event_id:
+            await redis.hset("aegis:event:stages", event_id, "advisory")
+            await redis.publish(BROADCAST_CHANNEL, json.dumps({
+                "type": "stage_update",
+                "event_id": event_id,
+                "stage": "advisory",
+            }))
 
         logger.info(
             "Broadcast advisory for %s to %d receiver(s) + stream.",

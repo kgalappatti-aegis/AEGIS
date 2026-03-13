@@ -47,6 +47,7 @@ class AdvisoryState(TypedDict, total=False):
     # Detection output
     sigma_rules:              list[str]
     coverage_gaps:            list[str]
+    validation_tests:         list[dict[str, Any]]  # Atomic Red Team tests
     detection_summary:        str
     detected_at:              str
 

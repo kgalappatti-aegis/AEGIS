@@ -28,6 +28,7 @@ PRIORITY_MATRIX: dict[str, str] = {
     "threatfox": "P1",   # Active IOC / malware intel feed
     "nvd":       "P2",   # NVD vulnerability disclosure
     "stix":      "P3",   # Structured threat intel bundle (STIX/TAXII)
+    "misp":      "P1",   # MISP threat intel (inherits MISP threat_level)
 }
 
 
@@ -46,6 +47,7 @@ ROUTING_MATRIX: dict[str, str] = {
     "threatfox": "triage",      # Active IOCs need immediate review
     "nvd":       "advisory",    # CVE disclosures → advisory queue
     "stix":      "simulation",  # STIX bundles → adversary simulation
+    "misp":      "triage",     # MISP events → triage for relevance scoring
 }
 
 
