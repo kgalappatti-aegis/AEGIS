@@ -788,3 +788,29 @@ async def get_simulation(event_id: str) -> JSONResponse:
             logger.warning("PostgreSQL finding lookup failed for %s: %s", event_id, exc)
 
     return JSONResponse(status_code=404, content={"error": "not found"})
+
+
+@app.get("/api/infra/status")
+async def infra_status() -> dict:
+    """Return infrastructure sync status and asset distribution summaries."""
+    r: aioredis.Redis = app.state.redis_api
+
+    last_sync, asset_count, source, subtype_dist, crit_dist = await asyncio.gather(
+        r.get("aegis:infra:last_sync"),
+        r.get("aegis:infra:asset_count"),
+        r.get("aegis:infra:source"),
+        r.hgetall("aegis:infra:subtype_counts"),
+        r.hgetall("aegis:infra:criticality_dist"),
+    )
+
+    return {
+        "last_sync": last_sync,
+        "asset_count": int(asset_count) if asset_count else 0,
+        "source": source,
+        "subtype_distribution": {
+            k: int(v) for k, v in subtype_dist.items()
+        },
+        "criticality_distribution": {
+            k: int(v) for k, v in crit_dist.items()
+        },
+    }

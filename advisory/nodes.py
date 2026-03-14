@@ -107,9 +107,23 @@ async def load_event(state: AdvisoryState) -> dict[str, Any]:
     except json.JSONDecodeError:
         raw_payload = {}
 
-    # Derive cve_id: advisory queue doesn't carry a top-level cve_id field,
-    # but raw_payload (NVD CVE object) has it at root.
-    cve_id = raw_payload.get("id") or raw_payload.get("cve_id") or fields.get("cve_id")
+    # Derive cve_id from multiple possible locations across source types
+    cve_id = (
+        raw_payload.get("id")
+        or raw_payload.get("cve_id")
+        or fields.get("cve_id")
+    )
+    # Fallback: regex scan text fields for CVE patterns (MISP, EDR, SIEM)
+    if not cve_id:
+        _cve_re = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+        for text_field in ("info", "title", "description", "short_description",
+                           "vulnerability_name", "rule_name"):
+            text = raw_payload.get(text_field, "")
+            if text:
+                m = _cve_re.search(str(text))
+                if m:
+                    cve_id = m.group(0).upper()
+                    break
 
     return {
         "event_id":             fields.get("event_id",    ""),
@@ -130,7 +144,7 @@ async def load_event(state: AdvisoryState) -> dict[str, Any]:
         "blind_spots":              _json_list(fields, "blind_spots"),
         "compound_risk_factors":    _json_list(fields, "compound_risk_factors"),
         "recommended_detections":   _json_list(fields, "recommended_detections"),
-        "severity":                 fields.get("severity",    "medium"),
+        "severity":                 fields.get("severity") or None,
         "sim_summary":              fields.get("summary",     ""),
         "simulated_at":             fields.get("simulated_at",""),
         # Detection output
@@ -179,9 +193,15 @@ async def generate_advisory(
     Call Claude to produce a structured advisory card from the full
     pipeline context (triage + simulation + detection).
     """
-    cve_id   = state.get("cve_id",   "UNKNOWN")
-    severity = state.get("severity", "medium")
+    cve_id   = state.get("cve_id") or "UNKNOWN"
     priority = state.get("priority", "P3")
+
+    # Severity from simulation; if not set, derive from priority so P0
+    # events don't default to "medium"
+    severity = state.get("severity")
+    if not severity:
+        _PRIORITY_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
+        severity = _PRIORITY_SEVERITY.get(priority, "medium")
 
     user_content = json.dumps({
         "pipeline_context": {
@@ -215,10 +235,24 @@ async def generate_advisory(
         "response_schema": _RESPONSE_SCHEMA,
     }, indent=2)
 
+    # Build a meaningful label for non-CVE events
+    raw_payload = state.get("raw_payload", {})
+    event_label = cve_id
+    if cve_id == "UNKNOWN":
+        event_label = (
+            raw_payload.get("title")
+            or raw_payload.get("info")
+            or raw_payload.get("rule_name")
+            or raw_payload.get("vulnerability_name")
+            or f"{state.get('source_type', 'unknown')} alert"
+        )
+        if len(event_label) > 60:
+            event_label = event_label[:57] + "..."
+
     fallback: dict[str, Any] = {
-        "title":             f"Security Advisory: {cve_id}",
+        "title":             f"Security Advisory: {event_label}",
         "executive_summary": (
-            f"A {severity}-severity vulnerability ({cve_id}) has been identified "
+            f"A {severity}-severity event ({event_label}) has been identified "
             f"with a breach probability of {state.get('p_breach', 0):.0%}. "
             "Manual analyst review is required."
         ),

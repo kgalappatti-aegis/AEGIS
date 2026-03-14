@@ -267,7 +267,75 @@ Not all events pass through every stage. NVD events (`nvd -> advisory`) skip tri
 
 ---
 
-## 7. Worked Example
+## 7. Anthropic API Cost Estimation
+
+Each event that traverses the full pipeline (triage → simulation → detection → advisory) makes multiple Claude API calls. This section estimates per-event and daily costs.
+
+### 7.1 Model Usage by Agent
+
+| Agent | Call | Model | Calls per Event |
+|---|---|---|---|
+| **Triage** | Relevance scoring | Neo4j queries only (no LLM) | 0 |
+| **Simulation** | Result interpretation | `claude-sonnet-4-6` | 1 |
+| **Detection** | Primary rule generation | `claude-sonnet-4-6` | 1 |
+| **Detection** | Per-TTP rule generation | `claude-haiku-4-5` | 3–8 (varies by path length) |
+| **Advisory** | Risk assessment & write-up | `claude-sonnet-4-6` | 1 |
+
+### 7.2 Token Estimates per Call
+
+| Call | Input Tokens | Output Tokens |
+|---|---|---|
+| Simulation interpretation | ~2,000 | ~500 |
+| Detection (primary) | ~2,500 | ~1,500 |
+| Detection (per-TTP) | ~1,500 | ~1,000 |
+| Advisory generation | ~3,000 | ~2,000 |
+
+### 7.3 Model Pricing (as of 2025)
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|---|---|---|
+| `claude-sonnet-4-6` | $3.00 | $15.00 |
+| `claude-haiku-4-5` | $0.80 | $4.00 |
+
+### 7.4 Per-Event Cost Breakdown (Full Pipeline)
+
+Assuming 5 TTPs per event (typical for a high-severity path):
+
+| Call | Model | Input Cost | Output Cost | Subtotal |
+|---|---|---|---|---|
+| Simulation interpretation (×1) | Sonnet | $0.006 | $0.0075 | $0.0135 |
+| Detection primary (×1) | Sonnet | $0.0075 | $0.0225 | $0.030 |
+| Detection per-TTP (×5) | Haiku | $0.006 | $0.020 | $0.026 |
+| Advisory generation (×1) | Sonnet | $0.009 | $0.030 | $0.039 |
+| **Total per event** | | | | **~$0.027–$0.040** |
+
+### 7.5 Cost by Agent Share
+
+| Agent | Share of Cost |
+|---|---|
+| Detection (primary + per-TTP) | ~52% |
+| Advisory | ~36% |
+| Simulation | ~12% |
+
+### 7.6 Daily Cost Projections
+
+| Scenario | Events/Day | Est. Daily Cost |
+|---|---|---|
+| Light (dev/test) | 20 | ~$0.54–$0.80 |
+| Moderate | 100 | ~$2.70–$4.00 |
+| Heavy | 500 | ~$13.50–$20.00 |
+| Stress test (harness) | 1,000 | ~$27–$40 |
+
+### 7.7 Cost Optimization Notes
+
+- Switching per-TTP detection from Sonnet to Haiku reduced per-event cost by ~30% (from ~$0.046–$0.077 to ~$0.027–$0.040).
+- NVD events (`nvd → advisory`) skip triage, simulation, and detection — they incur only the advisory call (~$0.039).
+- EDR events (`edr → detection`) skip triage and simulation — they incur detection + advisory (~$0.027).
+- The `DETECTION_SKIP_LOW` flag (default `false`) can further reduce costs by skipping detection for low-severity events.
+
+---
+
+## 8. Worked Example
 
 **Event:** CVE-2025-22457 (Ivanti Connect Secure RCE), source: `cisa_kev`, CVSS 9.8
 

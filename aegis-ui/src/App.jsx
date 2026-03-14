@@ -693,6 +693,9 @@ function IngestionView({ inbound, stats, newIds, stages }) {
     borderBottom: `1px solid ${C.border}`,
     background: C.card,
     whiteSpace: 'nowrap',
+    position: 'sticky',
+    top: 0,
+    zIndex: 1,
   };
 
   const td = (extra = {}) => ({
@@ -775,6 +778,8 @@ function IngestionView({ inbound, stats, newIds, stages }) {
         border: `1px solid ${C.border}`,
         borderRadius: 6,
         overflow: 'hidden',
+        maxHeight: 'calc(100vh - 340px)',
+        overflowY: 'auto',
       }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
@@ -872,6 +877,9 @@ function EventsView({ events, newIds }) {
     borderBottom: `1px solid ${C.border}`,
     background: C.card,
     whiteSpace: 'nowrap',
+    position: 'sticky',
+    top: 0,
+    zIndex: 1,
   };
 
   return (
@@ -897,6 +905,8 @@ function EventsView({ events, newIds }) {
         border: `1px solid ${C.border}`,
         borderRadius: 6,
         overflow: 'hidden',
+        maxHeight: 'calc(100vh - 260px)',
+        overflowY: 'auto',
       }}>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
@@ -1090,31 +1100,33 @@ function AdvisoriesView({ advisories, newIds }) {
         </span>
       </div>
 
-      {filtered.length === 0 ? (
-        <div style={{
-          background: C.surface,
-          border: `1px solid ${C.border}`,
-          borderRadius: 6,
-          padding: '52px 32px',
-          textAlign: 'center',
-          color: C.muted,
-          fontSize: 12,
-          lineHeight: 1.8,
-        }}>
-          {advisories.length === 0
-            ? <>No advisories yet.<br />They will appear here as events complete the full pipeline.</>
-            : 'No advisories match the current filter.'
-          }
-        </div>
-      ) : (
-        filtered.map(adv => (
-          <AdvisoryCard
-            key={adv._uid}
-            adv={adv}
-            isNew={newIds.has(adv._uid)}
-          />
-        ))
-      )}
+      <div style={{ maxHeight: 'calc(100vh - 260px)', overflowY: 'auto' }}>
+        {filtered.length === 0 ? (
+          <div style={{
+            background: C.surface,
+            border: `1px solid ${C.border}`,
+            borderRadius: 6,
+            padding: '52px 32px',
+            textAlign: 'center',
+            color: C.muted,
+            fontSize: 12,
+            lineHeight: 1.8,
+          }}>
+            {advisories.length === 0
+              ? <>No advisories yet.<br />They will appear here as events complete the full pipeline.</>
+              : 'No advisories match the current filter.'
+            }
+          </div>
+        ) : (
+          filtered.map(adv => (
+            <AdvisoryCard
+              key={adv._uid}
+              adv={adv}
+              isNew={newIds.has(adv._uid)}
+            />
+          ))
+        )}
+      </div>
     </div>
   );
 }
