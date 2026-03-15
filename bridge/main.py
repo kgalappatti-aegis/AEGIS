@@ -487,12 +487,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await conn.execute("""
                     INSERT INTO workspace_config (key, value, description)
                     VALUES
-                        ('triage_threshold',  '0.4',                       'Minimum relevance score for simulation routing'),
-                        ('sim_threshold',     '0.55',                      'Monte Carlo breach probability threshold'),
-                        ('detection_skip_low','false',                     'Skip detection for P3 events'),
-                        ('sim_iterations',    '10000',                     'Monte Carlo iteration count'),
-                        ('advisory_model',    'claude-sonnet-4-6',         'LLM model for advisory generation'),
-                        ('detection_model',   'claude-haiku-4-5-20251001', 'LLM model for per-TTP detection')
+                        ('triage_threshold',      '0.4',                       'Minimum relevance score for simulation routing'),
+                        ('infra_match_weight',    '0.4',                       'Infrastructure match weight in triage scoring'),
+                        ('threat_actor_weight',   '0.25',                      'Threat actor history weight in triage scoring'),
+                        ('sim_threshold',         '0.55',                      'Monte Carlo breach probability threshold'),
+                        ('sim_iterations',        '10000',                     'Monte Carlo iterations per event'),
+                        ('sim_daily_budget',      '500000',                    'Maximum Monte Carlo iterations per day'),
+                        ('sim_strategy',          'vuln_first',                'Default polymorphic simulation strategy'),
+                        ('advisory_model',        'claude-sonnet-4-6',         'LLM model for advisory generation'),
+                        ('advisory_temperature',  '0.3',                       'LLM temperature for advisory generation'),
+                        ('approval_p1',           'true',                      'Require approval for P1 advisories'),
+                        ('approval_p2',           'false',                     'Require approval for P2 advisories'),
+                        ('detection_model',       'claude-haiku-4-5-20251001', 'LLM model for per-TTP detection'),
+                        ('detection_skip_low',    'false',                     'Skip detection for P3 events'),
+                        ('sigma_min_confidence',  '0.70',                      'Minimum Sigma rule confidence threshold'),
+                        ('detection_auto_upgrade','true',                      'Auto-mark TTP as detected when rule meets confidence')
                     ON CONFLICT (key) DO NOTHING
                 """)
             logger.info("workspace_config table ready.")

@@ -1294,20 +1294,132 @@ function ApprovalsView({ approvals, onDecision }) {
 
 // ── Settings View ─────────────────────────────────────────────────────────────
 
+// ── Settings sub-components ───────────────────────────────────────────────────
+
+function SettingsSlider({ label, hint, configKey, min, max, step, fmt, edits, setEdits, configMap }) {
+  const current = edits[configKey] !== undefined ? edits[configKey] : (configMap[configKey] || '0');
+  const numVal = parseFloat(current);
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+        <span style={{ color: C.textBright, fontSize: 12, fontWeight: 600 }}>{label}</span>
+        <span style={{ color: C.teal, fontSize: 13, fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>
+          {fmt ? fmt(numVal) : current}
+        </span>
+      </div>
+      <input
+        type="range" min={min} max={max} step={step}
+        value={numVal}
+        onChange={e => setEdits(prev => ({ ...prev, [configKey]: e.target.value }))}
+        style={{ width: '100%', accentColor: C.teal }}
+      />
+      {hint && <div style={{ color: C.muted, fontSize: 10, fontStyle: 'italic', marginTop: 4, lineHeight: 1.4 }}>{hint}</div>}
+    </div>
+  );
+}
+
+function SettingsToggle({ label, hint, configKey, edits, setEdits, configMap }) {
+  const current = edits[configKey] !== undefined ? edits[configKey] : (configMap[configKey] || 'false');
+  const on = current === 'true';
+  const toggle = () => setEdits(prev => ({ ...prev, [configKey]: on ? 'false' : 'true' }));
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+      <button onClick={toggle} style={{
+        width: 40, height: 22, borderRadius: 11, border: 'none', cursor: 'pointer',
+        background: on ? C.teal : C.border, position: 'relative', transition: 'background 0.2s', flexShrink: 0,
+      }}>
+        <span style={{
+          position: 'absolute', top: 2, left: on ? 20 : 2,
+          width: 18, height: 18, borderRadius: '50%', background: '#fff',
+          transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+        }} />
+      </button>
+      <div>
+        <div style={{ color: C.text, fontSize: 11 }}>{label}</div>
+        {hint && <div style={{ color: C.muted, fontSize: 10 }}>{hint}</div>}
+      </div>
+    </div>
+  );
+}
+
+function SettingsSelect({ label, configKey, options, edits, setEdits, configMap }) {
+  const current = edits[configKey] !== undefined ? edits[configKey] : (configMap[configKey] || '');
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ color: C.textBright, fontSize: 12, fontWeight: 600, marginBottom: 6 }}>{label}</div>
+      <select
+        value={current}
+        onChange={e => setEdits(prev => ({ ...prev, [configKey]: e.target.value }))}
+        style={{
+          width: '100%', background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+          borderRadius: 4, padding: '8px 12px', fontSize: 12, fontFamily: 'inherit', outline: 'none',
+        }}
+      >
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
+
+function SettingsInput({ label, hint, configKey, edits, setEdits, configMap }) {
+  const current = edits[configKey] !== undefined ? edits[configKey] : (configMap[configKey] || '');
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ color: C.textBright, fontSize: 12, fontWeight: 600, marginBottom: 6 }}>{label}</div>
+      <input
+        type="text" value={current}
+        onChange={e => setEdits(prev => ({ ...prev, [configKey]: e.target.value }))}
+        style={{
+          width: '100%', background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+          borderRadius: 4, padding: '8px 12px', fontSize: 12, fontFamily: 'inherit', outline: 'none',
+          boxSizing: 'border-box',
+        }}
+      />
+      {hint && <div style={{ color: C.muted, fontSize: 10, marginTop: 4 }}>{hint}</div>}
+    </div>
+  );
+}
+
+function AgentCard({ title, color, children }) {
+  return (
+    <div style={{
+      background: C.card, border: `1px solid ${C.border}`, borderTop: `2px solid ${color}`,
+      borderRadius: 6, padding: '20px 22px',
+    }}>
+      <div style={{
+        color, fontSize: 12, fontWeight: 700, letterSpacing: '0.1em', marginBottom: 16,
+      }}>
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ── Settings View ─────────────────────────────────────────────────────────────
+
 function SettingsView({ config, onConfigSave, budget, onBudgetSave, paused, onTogglePause }) {
   const [edits, setEdits] = useState({});
-  const [budgetLimit, setBudgetLimit] = useState('');
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    if (budget) setBudgetLimit(String(budget.limit));
-  }, [budget]);
+  // Build a key→value map from config array
+  const configMap = {};
+  for (const c of config) configMap[c.key] = c.value;
 
-  const handleSave = async (key) => {
-    const value = edits[key];
-    if (value === undefined) return;
-    await onConfigSave(key, value);
-    setEdits(prev => { const n = { ...prev }; delete n[key]; return n; });
+  const hasEdits = Object.keys(edits).length > 0;
+
+  const handleSaveAll = async () => {
+    setSaving(true);
+    for (const [key, value] of Object.entries(edits)) {
+      await onConfigSave(key, value);
+    }
+    setEdits({});
+    setSaving(false);
   };
+
+  const fmtPct = v => (v * 100).toFixed(0) + '%';
+  const fmtDec = v => parseFloat(v).toFixed(2);
+  const fmtInt = v => Number(v).toLocaleString();
 
   return (
     <div>
@@ -1338,118 +1450,118 @@ function SettingsView({ config, onConfigSave, budget, onBudgetSave, paused, onTo
         </div>
       </div>
 
-      {/* Simulation Budget */}
-      {budget && (
-        <div style={{
-          background: C.card, border: `1px solid ${C.border}`, borderRadius: 6,
-          padding: '20px 24px', marginBottom: 16,
-        }}>
-          <div style={{ color: C.textBright, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Simulation Budget</div>
-          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-end', marginBottom: 12 }}>
-            <div>
-              <div style={{ color: C.muted, fontSize: 9, letterSpacing: '0.1em', marginBottom: 3 }}>USED TODAY</div>
-              <div style={{ color: budget.used >= budget.limit ? C.red : C.purple, fontSize: 28, fontWeight: 700, lineHeight: 1 }}>
-                {budget.used}
-              </div>
-            </div>
-            <div>
-              <div style={{ color: C.muted, fontSize: 9, letterSpacing: '0.1em', marginBottom: 3 }}>DAILY LIMIT</div>
-              <div style={{ color: C.textBright, fontSize: 28, fontWeight: 700, lineHeight: 1 }}>
-                {budget.limit}
-              </div>
-            </div>
-            <div style={{ flex: 1 }}>
+      {/* Agent cards – 3 column grid */}
+      {config.length === 0 ? (
+        <div style={{ color: C.muted, fontSize: 12, textAlign: 'center', padding: 40 }}>Loading configuration…</div>
+      ) : (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16, marginBottom: 16 }}>
+            {/* ── Triage Agent ──────────────────────────────────────────── */}
+            <AgentCard title="TRIAGE AGENT" color={C.orange}>
+              <SettingsSlider label="Relevance Threshold (triggers simulation)" configKey="triage_threshold"
+                min={0} max={1} step={0.01} fmt={fmtDec}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+                hint="Lower = more events simulated (higher coverage, higher cost)\nHigher = fewer events simulated (lower noise, lower cost)"
+              />
+              <SettingsSlider label="Infrastructure Match Weight" configKey="infra_match_weight"
+                min={0} max={1} step={0.01} fmt={fmtPct}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+              <SettingsSlider label="Threat Actor History Weight" configKey="threat_actor_weight"
+                min={0} max={1} step={0.01} fmt={fmtPct}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+            </AgentCard>
+
+            {/* ── Simulation Agent ──────────────────────────────────────── */}
+            <AgentCard title="SIMULATION AGENT" color={C.purple}>
+              <SettingsInput label="Daily Iteration Budget" configKey="sim_daily_budget"
+                hint="Maximum Monte Carlo iterations per day"
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+              <SettingsSelect label="Default Polymorphic Strategy" configKey="sim_strategy"
+                options={[
+                  { value: 'vuln_first', label: 'Vuln-First (default)' },
+                  { value: 'evasion_first', label: 'Evasion-First' },
+                  { value: 'stealth', label: 'Stealth' },
+                  { value: 'blitz', label: 'Blitz' },
+                ]}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+              <SettingsSlider label="Monte Carlo Iterations per Event" configKey="sim_iterations"
+                min={1000} max={50000} step={1000} fmt={fmtInt}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+            </AgentCard>
+
+            {/* ── Advisory Agent ────────────────────────────────────────── */}
+            <AgentCard title="ADVISORY AGENT" color={C.green}>
+              <SettingsSlider label="LLM Temperature" configKey="advisory_temperature"
+                min={0} max={1} step={0.05} fmt={fmtDec}
+                edits={edits} setEdits={setEdits} configMap={configMap}
+                hint="Lower (0.1) = consistent, conservative recommendations\nHigher (0.5) = creative threat analysis"
+              />
+              <div style={{ color: C.textBright, fontSize: 12, fontWeight: 600, marginBottom: 10 }}>Approval Requirements</div>
+              <SettingsToggle label="Require approval for P1 advisories" configKey="approval_p1"
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
+              <SettingsToggle label="Require approval for P2 advisories" configKey="approval_p2"
+                edits={edits} setEdits={setEdits} configMap={configMap}
+              />
               <div style={{
-                height: 8, borderRadius: 4, background: C.surface,
-                border: `1px solid ${C.border}`, overflow: 'hidden',
+                marginTop: 8, padding: '8px 12px', borderRadius: 4,
+                background: 'rgba(0,212,170,0.06)', border: `1px solid ${C.teal}22`,
+                color: C.teal, fontSize: 10, fontStyle: 'italic',
               }}>
-                <div style={{
-                  height: '100%', borderRadius: 4,
-                  width: `${Math.min(100, (budget.used / budget.limit) * 100)}%`,
-                  background: budget.used >= budget.limit ? C.red : C.purple,
-                  transition: 'width 0.3s',
-                }} />
+                P0 advisories always auto-send immediately (no approval required)
               </div>
-            </div>
+            </AgentCard>
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <span style={{ color: C.muted, fontSize: 10 }}>SET LIMIT:</span>
-            <input
-              type="number" value={budgetLimit} onChange={e => setBudgetLimit(e.target.value)}
-              style={{
-                background: C.surface, border: `1px solid ${C.border}`, borderRadius: 3,
-                color: C.text, fontSize: 12, padding: '4px 10px', width: 80, outline: 'none',
-              }}
-            />
+
+          {/* ── Detection Agent (full width) ─────────────────────────────── */}
+          <div style={{ marginBottom: 16 }}>
+            <AgentCard title="DETECTION AGENT" color={C.teal}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+                <div>
+                  <SettingsSlider label="Minimum Sigma Rule Confidence" configKey="sigma_min_confidence"
+                    min={0} max={1} step={0.01} fmt={fmtDec}
+                    edits={edits} setEdits={setEdits} configMap={configMap}
+                    hint="Rules below this threshold require analyst review"
+                  />
+                </div>
+                <div>
+                  <div style={{ color: C.textBright, fontSize: 12, fontWeight: 600, marginBottom: 10 }}>Auto-Upgrade Coverage Status</div>
+                  <SettingsToggle
+                    label={'Auto-mark TTP as "detected" when rule \u2265 confidence'}
+                    configKey="detection_auto_upgrade"
+                    edits={edits} setEdits={setEdits} configMap={configMap}
+                  />
+                </div>
+              </div>
+            </AgentCard>
+          </div>
+
+          {/* ── Save button ──────────────────────────────────────────────── */}
+          <div style={{ textAlign: 'center', marginTop: 8 }}>
             <button
-              onClick={() => onBudgetSave(parseInt(budgetLimit) || 50)}
+              onClick={handleSaveAll}
+              disabled={!hasEdits || saving}
               style={{
-                background: C.teal + '22', border: `1px solid ${C.teal}55`, color: C.teal,
-                fontSize: 10, fontWeight: 600, padding: '4px 12px', borderRadius: 3, cursor: 'pointer',
+                background: hasEdits ? C.teal : C.border,
+                border: 'none',
+                color: hasEdits ? '#000' : C.muted,
+                fontSize: 13, fontWeight: 700, padding: '12px 48px', borderRadius: 5,
+                cursor: hasEdits ? 'pointer' : 'default',
+                letterSpacing: '0.1em',
+                opacity: saving ? 0.6 : 1,
+                transition: 'background 0.2s, color 0.2s',
               }}
             >
-              SAVE
+              {saving ? 'SAVING…' : 'SAVE CONFIGURATION'}
             </button>
           </div>
-        </div>
+        </>
       )}
-
-      {/* Agent Configuration */}
-      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 6, padding: '20px 24px' }}>
-        <div style={{ color: C.textBright, fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Agent Configuration</div>
-        {config.length === 0 ? (
-          <div style={{ color: C.muted, fontSize: 12 }}>Loading configuration…</div>
-        ) : (
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr>
-                {['KEY', 'VALUE', 'DESCRIPTION', ''].map(h => (
-                  <th key={h} style={{
-                    textAlign: 'left', color: C.muted, fontSize: 9, fontWeight: 600,
-                    letterSpacing: '0.1em', padding: '8px 10px', borderBottom: `1px solid ${C.border}`,
-                  }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {config.map(c => (
-                <tr key={c.key}>
-                  <td style={{ color: C.teal, fontSize: 11, fontWeight: 600, padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
-                    {c.key}
-                  </td>
-                  <td style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
-                    <input
-                      type="text"
-                      value={edits[c.key] !== undefined ? edits[c.key] : c.value}
-                      onChange={e => setEdits(prev => ({ ...prev, [c.key]: e.target.value }))}
-                      style={{
-                        background: C.surface, border: `1px solid ${edits[c.key] !== undefined ? C.teal : C.border}`,
-                        borderRadius: 3, color: C.text, fontSize: 11, padding: '3px 8px', width: 140, outline: 'none',
-                      }}
-                    />
-                  </td>
-                  <td style={{ color: C.muted, fontSize: 11, padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
-                    {c.description}
-                  </td>
-                  <td style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
-                    {edits[c.key] !== undefined && (
-                      <button
-                        onClick={() => handleSave(c.key)}
-                        style={{
-                          background: C.teal + '22', border: `1px solid ${C.teal}55`, color: C.teal,
-                          fontSize: 10, fontWeight: 600, padding: '2px 10px', borderRadius: 3, cursor: 'pointer',
-                        }}
-                      >
-                        SAVE
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
     </div>
   );
 }
