@@ -33,7 +33,9 @@ import logging
 import os
 import sys
 import time
+import uuid as _uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import AsyncIterator
 
 import asyncpg
@@ -470,6 +472,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db_pool = None
     app.state.db_pool = db_pool
 
+    # Ensure HITL tables exist (idempotent — safe to run on every startup)
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS workspace_config (
+                        key         TEXT PRIMARY KEY,
+                        value       TEXT NOT NULL,
+                        description TEXT,
+                        updated_at  TIMESTAMPTZ DEFAULT now()
+                    )
+                """)
+                await conn.execute("""
+                    INSERT INTO workspace_config (key, value, description)
+                    VALUES
+                        ('triage_threshold',  '0.4',                       'Minimum relevance score for simulation routing'),
+                        ('sim_threshold',     '0.55',                      'Monte Carlo breach probability threshold'),
+                        ('detection_skip_low','false',                     'Skip detection for P3 events'),
+                        ('sim_iterations',    '10000',                     'Monte Carlo iteration count'),
+                        ('advisory_model',    'claude-sonnet-4-6',         'LLM model for advisory generation'),
+                        ('detection_model',   'claude-haiku-4-5-20251001', 'LLM model for per-TTP detection')
+                    ON CONFLICT (key) DO NOTHING
+                """)
+            logger.info("workspace_config table ready.")
+        except Exception as exc:
+            logger.warning("workspace_config bootstrap failed: %s", exc)
+
     # Inbound tail needs its own connection (it blocks on XREAD independently)
     redis_inbound = aioredis.from_url(
         REDIS_URL,
@@ -814,3 +843,350 @@ async def infra_status() -> dict:
             k: int(v) for k, v in crit_dist.items()
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints – Kill Switch
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/pause")
+async def admin_pause() -> dict:
+    """Pause all agent processing (Kill Switch ON)."""
+    r: aioredis.Redis = app.state.redis_api
+    await r.set("aegis:system:paused", "true")
+    await r.publish("aegis:broadcast", json.dumps({
+        "type": "system_status",
+        "paused": True,
+    }))
+    logger.warning("KILL SWITCH ENGAGED — all agents paused.")
+    return {"paused": True}
+
+
+@app.post("/api/admin/resume")
+async def admin_resume() -> dict:
+    """Resume all agent processing (Kill Switch OFF)."""
+    r: aioredis.Redis = app.state.redis_api
+    await r.delete("aegis:system:paused")
+    await r.publish("aegis:broadcast", json.dumps({
+        "type": "system_status",
+        "paused": False,
+    }))
+    logger.info("Kill switch released — agents resuming.")
+    return {"paused": False}
+
+
+@app.get("/api/admin/status")
+async def admin_status() -> dict:
+    """Return current system pause state."""
+    r: aioredis.Redis = app.state.redis_api
+    paused = await r.get("aegis:system:paused")
+    return {"paused": paused == "true"}
+
+
+# ---------------------------------------------------------------------------
+# Config endpoints – Agent Tuning
+# ---------------------------------------------------------------------------
+
+@app.get("/api/config")
+async def get_config() -> list[dict]:
+    """Return all workspace configuration parameters."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT key, value, description, updated_at FROM workspace_config ORDER BY key"
+            )
+        return [
+            {
+                "key": r["key"],
+                "value": r["value"],
+                "description": r["description"],
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.warning("Config fetch failed (table may not exist yet): %s", exc)
+        return []
+
+
+@app.put("/api/config/{key}")
+async def update_config(key: str, body: dict) -> dict:
+    """Update a single configuration parameter and invalidate Redis cache."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+    value = body.get("value")
+    if value is None:
+        return JSONResponse(status_code=400, content={"error": "missing 'value'"})
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE workspace_config SET value = $1, updated_at = now() WHERE key = $2 RETURNING key, value, description, updated_at",
+            str(value), key,
+        )
+    if not row:
+        return JSONResponse(status_code=404, content={"error": f"key '{key}' not found"})
+
+    # Invalidate Redis config cache so agents pick up the change
+    r: aioredis.Redis = app.state.redis_api
+    await r.delete(f"aegis:config:{key}")
+    await r.publish("aegis:broadcast", json.dumps({
+        "type": "config_update",
+        "key": key,
+        "value": str(value),
+    }))
+
+    return {
+        "key": row["key"],
+        "value": row["value"],
+        "description": row["description"],
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Simulation Budget endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/budget")
+async def get_budget() -> dict:
+    """Return today's simulation budget usage."""
+    from datetime import date
+    r: aioredis.Redis = app.state.redis_api
+    today = date.today().isoformat()
+    budget_key = f"aegis:sim:budget:{today}"
+    used = await r.get(budget_key)
+    limit = await r.get("aegis:sim:daily_limit")
+    return {
+        "date": today,
+        "used": int(used) if used else 0,
+        "limit": int(limit) if limit else 50,
+    }
+
+
+@app.put("/api/budget/limit")
+async def set_budget_limit(body: dict) -> dict:
+    """Set the daily simulation budget limit."""
+    r: aioredis.Redis = app.state.redis_api
+    limit = body.get("limit")
+    if limit is None:
+        return JSONResponse(status_code=400, content={"error": "missing 'limit'"})
+    await r.set("aegis:sim:daily_limit", str(int(limit)))
+    return {"limit": int(limit)}
+
+
+# ---------------------------------------------------------------------------
+# Approval Workflow endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/approvals")
+async def get_approvals(status: str = "pending") -> list[dict]:
+    """Return approval queue items filtered by status."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT aq.id, aq.advisory_id, aq.event_id, aq.priority, aq.title,
+                       aq.status, aq.requested_at, aq.decided_at, aq.decided_by, aq.comment,
+                       a.executive_summary, a.risk_score, a.severity, a.tlp, a.cve_id
+                FROM approval_queue aq
+                JOIN advisories a ON a.id = aq.advisory_id
+                WHERE aq.status = $1
+                ORDER BY aq.requested_at DESC
+                LIMIT 100
+                """,
+                status,
+            )
+        def _serialize_row(r):
+            out = {}
+            for k, v in dict(r).items():
+                if isinstance(v, datetime):
+                    out[k] = v.isoformat()
+                elif isinstance(v, _uuid.UUID):
+                    out[k] = str(v)
+                else:
+                    out[k] = v
+            return out
+        return [_serialize_row(r) for r in rows]
+    except Exception as exc:
+        logger.warning("Approvals fetch failed (table may not exist yet): %s", exc)
+        return []
+
+
+@app.post("/api/approvals/{approval_id}/approve")
+async def approve_advisory(approval_id: str, body: dict = {}) -> dict:
+    """Approve a pending advisory — broadcasts it to the main feed."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+
+    decided_by = body.get("decided_by", "analyst")
+    comment = body.get("comment", "")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE approval_queue
+            SET status = 'approved', decided_at = now(), decided_by = $2, comment = $3
+            WHERE id = $1::uuid AND status = 'pending'
+            RETURNING advisory_id, event_id
+            """,
+            approval_id, decided_by, comment,
+        )
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "approval not found or already decided"})
+
+        advisory_id = str(row["advisory_id"])
+        event_id = row["event_id"]
+
+        # Update advisory status
+        await conn.execute(
+            "UPDATE advisories SET approval_status = 'approved' WHERE id = $1::uuid",
+            advisory_id,
+        )
+
+        # Fetch full advisory for broadcast
+        adv = await conn.fetchrow(
+            "SELECT * FROM advisories WHERE id = $1::uuid",
+            advisory_id,
+        )
+
+    # Now broadcast the approved advisory
+    r: aioredis.Redis = app.state.redis_api
+    if adv:
+        payload = json.dumps({
+            "type": "advisory",
+            "event_id": event_id,
+            "advisory_id": advisory_id,
+            "cve_id": adv["cve_id"],
+            "priority": adv["priority"],
+            "severity": adv["severity"],
+            "p_breach": float(adv["p_breach"] or 0),
+            "risk_score": adv["risk_score"] or 0,
+            "title": adv["title"] or "",
+            "executive_summary": adv["executive_summary"] or "",
+            "tlp": adv["tlp"] or "AMBER",
+            "confidence": adv["confidence"] or "medium",
+            "mitre_techniques": json.loads(adv["mitre_techniques"] or "[]") if isinstance(adv["mitre_techniques"], str) else (adv["mitre_techniques"] or []),
+            "immediate_actions": json.loads(adv["immediate_actions"] or "[]") if isinstance(adv["immediate_actions"], str) else (adv["immediate_actions"] or []),
+            "detection_actions": json.loads(adv["detection_actions"] or "[]") if isinstance(adv["detection_actions"], str) else (adv["detection_actions"] or []),
+            "sigma_rules": json.loads(adv["sigma_rules"] or "[]") if isinstance(adv["sigma_rules"], str) else (adv["sigma_rules"] or []),
+            "coverage_gaps": json.loads(adv["coverage_gaps"] or "[]") if isinstance(adv["coverage_gaps"], str) else (adv["coverage_gaps"] or []),
+            "affected_assets": json.loads(adv["affected_assets"] or "[]") if isinstance(adv["affected_assets"], str) else (adv["affected_assets"] or []),
+            "approved": True,
+            "created_at": adv["created_at"].isoformat() if adv["created_at"] else None,
+        })
+        await r.publish(BROADCAST_CHANNEL, payload)
+        await r.xadd(ADVISORY_STREAM, {"data": payload}, maxlen=500, approximate=True)
+
+    # Update stage
+    if event_id:
+        await r.hset("aegis:event:stages", event_id, "advisory")
+        await r.publish(BROADCAST_CHANNEL, json.dumps({
+            "type": "stage_update",
+            "event_id": event_id,
+            "stage": "advisory",
+        }))
+
+    logger.info("Advisory %s approved by %s.", advisory_id, decided_by)
+    return {"status": "approved", "advisory_id": advisory_id}
+
+
+@app.post("/api/approvals/{approval_id}/reject")
+async def reject_advisory(approval_id: str, body: dict = {}) -> dict:
+    """Reject a pending advisory."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+
+    decided_by = body.get("decided_by", "analyst")
+    comment = body.get("comment", "")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE approval_queue
+            SET status = 'rejected', decided_at = now(), decided_by = $2, comment = $3
+            WHERE id = $1::uuid AND status = 'pending'
+            RETURNING advisory_id, event_id
+            """,
+            approval_id, decided_by, comment,
+        )
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "approval not found or already decided"})
+
+        await conn.execute(
+            "UPDATE advisories SET approval_status = 'rejected' WHERE id = $1::uuid",
+            str(row["advisory_id"]),
+        )
+
+    logger.info("Advisory %s rejected by %s.", row["advisory_id"], decided_by)
+    return {"status": "rejected", "advisory_id": str(row["advisory_id"])}
+
+
+# ---------------------------------------------------------------------------
+# Feedback endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/feedback")
+async def submit_feedback(body: dict) -> dict:
+    """Submit feedback on an advisory."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+
+    advisory_id = body.get("advisory_id")
+    event_id = body.get("event_id")
+    rating = body.get("rating")
+    comment = body.get("comment", "")
+
+    if not advisory_id or rating is None:
+        return JSONResponse(status_code=400, content={"error": "missing advisory_id or rating"})
+
+    rating = int(rating)
+    if rating < 1 or rating > 5:
+        return JSONResponse(status_code=400, content={"error": "rating must be 1-5"})
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO feedback (advisory_id, event_id, rating, comment)
+            VALUES ($1::uuid, $2, $3, $4)
+            RETURNING id
+            """,
+            advisory_id, event_id or "", rating, comment,
+        )
+
+    logger.info("Feedback submitted for advisory %s: rating=%d", advisory_id, rating)
+    return {"id": str(row["id"]), "advisory_id": advisory_id, "rating": rating}
+
+
+@app.get("/api/feedback/{advisory_id}")
+async def get_feedback(advisory_id: str) -> list[dict]:
+    """Get all feedback for a specific advisory."""
+    db_pool: asyncpg.Pool | None = app.state.db_pool
+    if not db_pool:
+        return JSONResponse(status_code=503, content={"error": "database unavailable"})
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, rating, comment, created_at FROM feedback WHERE advisory_id = $1::uuid ORDER BY created_at DESC",
+                advisory_id,
+            )
+        return [
+            {
+                "id": str(r["id"]),
+                "rating": r["rating"],
+                "comment": r["comment"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.warning("Feedback fetch failed: %s", exc)
+        return []

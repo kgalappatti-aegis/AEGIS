@@ -61,12 +61,13 @@ const TLP_STYLE = {
 };
 
 const STAGE_CFG = {
-  ingested:  { color: C.muted,  label: 'INGESTED'  },
-  routed:    { color: C.blue,   label: 'ROUTED'    },
-  triaged:   { color: C.orange, label: 'TRIAGED'   },
-  simulated: { color: C.purple, label: 'SIMULATED' },
-  detected:  { color: C.teal,   label: 'DETECTED'  },
-  advisory:  { color: C.green,  label: 'ADVISORY'  },
+  ingested:         { color: C.muted,  label: 'INGESTED'  },
+  routed:           { color: C.blue,   label: 'ROUTED'    },
+  triaged:          { color: C.orange, label: 'TRIAGED'   },
+  simulated:        { color: C.purple, label: 'SIMULATED' },
+  detected:         { color: C.teal,   label: 'DETECTED'  },
+  advisory:         { color: C.green,  label: 'ADVISORY'  },
+  pending_approval: { color: C.amber,  label: 'PENDING APPROVAL' },
 };
 
 const ROUTING_COLOR = {
@@ -361,6 +362,100 @@ function AdvisoryCard({ adv, isNew }) {
             </span>
           ))}
         </div>
+      )}
+
+      {/* ── Feedback widget ───────────────────────────────────────────── */}
+      {adv.advisory_id && <FeedbackWidget advisoryId={adv.advisory_id} eventId={adv.event_id} />}
+    </div>
+  );
+}
+
+function FeedbackWidget({ advisoryId, eventId }) {
+  const [rating, setRating]     = useState(0);
+  const [comment, setComment]   = useState('');
+  const [sent, setSent]         = useState(false);
+  const [hover, setHover]       = useState(0);
+
+  const submit = async () => {
+    if (rating < 1) return;
+    try {
+      await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ advisory_id: advisoryId, event_id: eventId, rating, comment }),
+      });
+      setSent(true);
+    } catch { /* ignore */ }
+  };
+
+  if (sent) {
+    return (
+      <div style={{ marginTop: 10, color: C.green, fontSize: 11 }}>
+        Feedback submitted — thank you.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+        <span style={{ color: C.muted, fontSize: 10, letterSpacing: '0.08em' }}>RATE THIS ADVISORY</span>
+        <div style={{ display: 'flex', gap: 2 }}>
+          {[1,2,3,4,5].map(n => (
+            <button
+              key={n}
+              onClick={() => setRating(n)}
+              onMouseEnter={() => setHover(n)}
+              onMouseLeave={() => setHover(0)}
+              style={{
+                background: 'none',
+                border: 'none',
+                fontSize: 16,
+                color: n <= (hover || rating) ? C.amber : C.border,
+                cursor: 'pointer',
+                padding: '0 1px',
+                transition: 'color 0.1s',
+              }}
+            >
+              ★
+            </button>
+          ))}
+        </div>
+        {rating > 0 && (
+          <button
+            onClick={submit}
+            style={{
+              background: C.teal + '22',
+              border: `1px solid ${C.teal}55`,
+              color: C.teal,
+              fontSize: 10,
+              fontWeight: 600,
+              padding: '3px 10px',
+              borderRadius: 3,
+              cursor: 'pointer',
+            }}
+          >
+            SEND
+          </button>
+        )}
+      </div>
+      {rating > 0 && (
+        <input
+          type="text"
+          value={comment}
+          onChange={e => setComment(e.target.value)}
+          placeholder="Optional comment…"
+          style={{
+            width: '100%',
+            background: C.surface,
+            border: `1px solid ${C.border}`,
+            borderRadius: 3,
+            color: C.text,
+            fontSize: 11,
+            padding: '5px 10px',
+            outline: 'none',
+          }}
+        />
       )}
     </div>
   );
@@ -784,7 +879,7 @@ function IngestionView({ inbound, stats, newIds, stages }) {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
-              {['TIME', 'EVENT ID', 'CVE / SOURCE', 'PRIORITY', 'STAGE', 'ROUTING', 'RELEVANCE', 'DESCRIPTION'].map(h => (
+              {['TIME', 'EVENT ID', 'CVE / SOURCE', 'PRIORITY', 'STAGE', 'ROUTING', 'DESCRIPTION'].map(h => (
                 <th key={h} style={thStyle}>{h}</th>
               ))}
             </tr>
@@ -792,7 +887,7 @@ function IngestionView({ inbound, stats, newIds, stages }) {
           <tbody>
             {filtered.length === 0 ? (
               <tr>
-                <td colSpan={8} style={{
+                <td colSpan={7} style={{
                   padding: 28,
                   textAlign: 'center',
                   color: C.muted,
@@ -816,12 +911,6 @@ function IngestionView({ inbound, stats, newIds, stages }) {
                     <td style={td()}><PriorityPill priority={ev.priority} /></td>
                     <td style={td()}><StagePill stage={stages[ev.event_id] || 'ingested'} /></td>
                     <td style={td({ color: routingColor })}>{ev.routing_target || '—'}</td>
-                    <td style={td({
-                      color: ev.relevance_score != null ? C.teal : C.muted,
-                      fontVariantNumeric: 'tabular-nums',
-                    })}>
-                      {ev.relevance_score != null ? parseFloat(ev.relevance_score).toFixed(3) : '—'}
-                    </td>
                     <td style={td({
                       color: C.muted,
                       maxWidth: 260,
@@ -1131,6 +1220,240 @@ function AdvisoriesView({ advisories, newIds }) {
   );
 }
 
+// ── Approvals View ────────────────────────────────────────────────────────────
+
+function ApprovalsView({ approvals, onDecision }) {
+  if (approvals.length === 0) {
+    return (
+      <div style={{
+        background: C.surface, border: `1px solid ${C.border}`, borderRadius: 6,
+        padding: '52px 32px', textAlign: 'center', color: C.muted, fontSize: 12, lineHeight: 1.8,
+      }}>
+        No pending approvals.<br />P1/P2 advisories will appear here for human review.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxHeight: 'calc(100vh - 260px)', overflowY: 'auto' }}>
+      {approvals.map(a => (
+        <div key={a.id} style={{
+          background: C.card, border: `1px solid ${C.border}`, borderLeft: `3px solid ${C[a.priority] || C.amber}`,
+          borderRadius: 6, padding: '16px 20px', marginBottom: 10,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <PriorityPill priority={a.priority} />
+              <span style={{ color: C.amber, fontSize: 12, fontWeight: 600 }}>{a.cve_id || 'CVE-UNKNOWN'}</span>
+              <span style={{ color: C.muted, fontSize: 11 }}>{a.event_id}</span>
+            </div>
+            <span style={{ color: C.muted, fontSize: 10 }}>
+              {a.requested_at ? new Date(a.requested_at).toLocaleString() : ''}
+            </span>
+          </div>
+          <div style={{ color: C.textBright, fontSize: 14, fontWeight: 600, marginBottom: 8 }}>
+            {a.title || '(no title)'}
+          </div>
+          {a.executive_summary && (
+            <div style={{ color: C.text, fontSize: 12, lineHeight: 1.6, marginBottom: 12, padding: '8px 12px', background: 'rgba(0,212,170,0.05)', borderRadius: 4 }}>
+              {a.executive_summary}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 8 }}>
+            <div><span style={{ color: C.muted, fontSize: 9 }}>RISK </span><span style={{ color: C.orange, fontSize: 16, fontWeight: 700 }}>{a.risk_score ?? '—'}</span></div>
+            <div><span style={{ color: C.muted, fontSize: 9 }}>SEVERITY </span><span style={{ color: C.red, fontSize: 12 }}>{(a.severity || '').toUpperCase()}</span></div>
+            <div><span style={{ color: C.muted, fontSize: 9 }}>TLP </span><TlpBadge tlp={a.tlp} /></div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+            <button
+              onClick={() => onDecision(a.id, 'approve')}
+              style={{
+                background: 'rgba(52,211,153,0.15)', border: `1px solid ${C.green}66`, color: C.green,
+                fontSize: 11, fontWeight: 700, padding: '6px 18px', borderRadius: 4, cursor: 'pointer',
+                letterSpacing: '0.06em',
+              }}
+            >
+              APPROVE
+            </button>
+            <button
+              onClick={() => onDecision(a.id, 'reject')}
+              style={{
+                background: 'rgba(255,68,85,0.12)', border: `1px solid ${C.red}55`, color: C.red,
+                fontSize: 11, fontWeight: 700, padding: '6px 18px', borderRadius: 4, cursor: 'pointer',
+                letterSpacing: '0.06em',
+              }}
+            >
+              REJECT
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Settings View ─────────────────────────────────────────────────────────────
+
+function SettingsView({ config, onConfigSave, budget, onBudgetSave, paused, onTogglePause }) {
+  const [edits, setEdits] = useState({});
+  const [budgetLimit, setBudgetLimit] = useState('');
+
+  useEffect(() => {
+    if (budget) setBudgetLimit(String(budget.limit));
+  }, [budget]);
+
+  const handleSave = async (key) => {
+    const value = edits[key];
+    if (value === undefined) return;
+    await onConfigSave(key, value);
+    setEdits(prev => { const n = { ...prev }; delete n[key]; return n; });
+  };
+
+  return (
+    <div>
+      {/* Kill Switch */}
+      <div style={{
+        background: C.card, border: `1px solid ${paused ? C.red + '66' : C.border}`,
+        borderRadius: 6, padding: '20px 24px', marginBottom: 16,
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <div style={{ color: C.textBright, fontSize: 14, fontWeight: 700, marginBottom: 4 }}>Kill Switch</div>
+            <div style={{ color: C.muted, fontSize: 11 }}>
+              {paused ? 'All agents are PAUSED. No events are being processed.' : 'All agents are running normally.'}
+            </div>
+          </div>
+          <button
+            onClick={onTogglePause}
+            style={{
+              background: paused ? 'rgba(52,211,153,0.15)' : 'rgba(255,68,85,0.15)',
+              border: `1px solid ${paused ? C.green + '66' : C.red + '66'}`,
+              color: paused ? C.green : C.red,
+              fontSize: 12, fontWeight: 700, padding: '8px 24px', borderRadius: 4, cursor: 'pointer',
+              letterSpacing: '0.06em',
+            }}
+          >
+            {paused ? 'RESUME' : 'PAUSE ALL'}
+          </button>
+        </div>
+      </div>
+
+      {/* Simulation Budget */}
+      {budget && (
+        <div style={{
+          background: C.card, border: `1px solid ${C.border}`, borderRadius: 6,
+          padding: '20px 24px', marginBottom: 16,
+        }}>
+          <div style={{ color: C.textBright, fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Simulation Budget</div>
+          <div style={{ display: 'flex', gap: 24, alignItems: 'flex-end', marginBottom: 12 }}>
+            <div>
+              <div style={{ color: C.muted, fontSize: 9, letterSpacing: '0.1em', marginBottom: 3 }}>USED TODAY</div>
+              <div style={{ color: budget.used >= budget.limit ? C.red : C.purple, fontSize: 28, fontWeight: 700, lineHeight: 1 }}>
+                {budget.used}
+              </div>
+            </div>
+            <div>
+              <div style={{ color: C.muted, fontSize: 9, letterSpacing: '0.1em', marginBottom: 3 }}>DAILY LIMIT</div>
+              <div style={{ color: C.textBright, fontSize: 28, fontWeight: 700, lineHeight: 1 }}>
+                {budget.limit}
+              </div>
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{
+                height: 8, borderRadius: 4, background: C.surface,
+                border: `1px solid ${C.border}`, overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%', borderRadius: 4,
+                  width: `${Math.min(100, (budget.used / budget.limit) * 100)}%`,
+                  background: budget.used >= budget.limit ? C.red : C.purple,
+                  transition: 'width 0.3s',
+                }} />
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ color: C.muted, fontSize: 10 }}>SET LIMIT:</span>
+            <input
+              type="number" value={budgetLimit} onChange={e => setBudgetLimit(e.target.value)}
+              style={{
+                background: C.surface, border: `1px solid ${C.border}`, borderRadius: 3,
+                color: C.text, fontSize: 12, padding: '4px 10px', width: 80, outline: 'none',
+              }}
+            />
+            <button
+              onClick={() => onBudgetSave(parseInt(budgetLimit) || 50)}
+              style={{
+                background: C.teal + '22', border: `1px solid ${C.teal}55`, color: C.teal,
+                fontSize: 10, fontWeight: 600, padding: '4px 12px', borderRadius: 3, cursor: 'pointer',
+              }}
+            >
+              SAVE
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Agent Configuration */}
+      <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 6, padding: '20px 24px' }}>
+        <div style={{ color: C.textBright, fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Agent Configuration</div>
+        {config.length === 0 ? (
+          <div style={{ color: C.muted, fontSize: 12 }}>Loading configuration…</div>
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                {['KEY', 'VALUE', 'DESCRIPTION', ''].map(h => (
+                  <th key={h} style={{
+                    textAlign: 'left', color: C.muted, fontSize: 9, fontWeight: 600,
+                    letterSpacing: '0.1em', padding: '8px 10px', borderBottom: `1px solid ${C.border}`,
+                  }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {config.map(c => (
+                <tr key={c.key}>
+                  <td style={{ color: C.teal, fontSize: 11, fontWeight: 600, padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
+                    {c.key}
+                  </td>
+                  <td style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
+                    <input
+                      type="text"
+                      value={edits[c.key] !== undefined ? edits[c.key] : c.value}
+                      onChange={e => setEdits(prev => ({ ...prev, [c.key]: e.target.value }))}
+                      style={{
+                        background: C.surface, border: `1px solid ${edits[c.key] !== undefined ? C.teal : C.border}`,
+                        borderRadius: 3, color: C.text, fontSize: 11, padding: '3px 8px', width: 140, outline: 'none',
+                      }}
+                    />
+                  </td>
+                  <td style={{ color: C.muted, fontSize: 11, padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
+                    {c.description}
+                  </td>
+                  <td style={{ padding: '8px 10px', borderBottom: `1px solid ${C.border}` }}>
+                    {edits[c.key] !== undefined && (
+                      <button
+                        onClick={() => handleSave(c.key)}
+                        style={{
+                          background: C.teal + '22', border: `1px solid ${C.teal}55`, color: C.teal,
+                          fontSize: 10, fontWeight: 600, padding: '2px 10px', borderRadius: 3, cursor: 'pointer',
+                        }}
+                      >
+                        SAVE
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Stat bar ──────────────────────────────────────────────────────────────────
 
 function StatBar({ stats, advisoryCount }) {
@@ -1185,7 +1508,7 @@ function StatBar({ stats, advisoryCount }) {
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
-function TabBar({ activeTab, onSwitch, unread }) {
+function TabBar({ activeTab, onSwitch, unread, pendingApprovals }) {
   return (
     <div style={{
       display: 'flex',
@@ -1197,7 +1520,9 @@ function TabBar({ activeTab, onSwitch, unread }) {
         { id: 'ingestion',  label: 'INGESTION'  },
         { id: 'events',     label: 'EVENTS'     },
         { id: 'advisories', label: 'ADVISORIES' },
+        { id: 'approvals',  label: 'APPROVALS'  },
         { id: 'attack',     label: 'ATT&CK'     },
+        { id: 'settings',   label: 'SETTINGS'   },
       ].map(tab => {
         const active = activeTab === tab.id;
         return (
@@ -1220,6 +1545,22 @@ function TabBar({ activeTab, onSwitch, unread }) {
             }}
           >
             {tab.label}
+            {tab.id === 'approvals' && pendingApprovals > 0 && (
+              <span style={{
+                background: C.amber,
+                color: '#000',
+                fontSize: 9,
+                fontWeight: 700,
+                padding: '1px 5px',
+                borderRadius: 8,
+                minWidth: 18,
+                textAlign: 'center',
+                lineHeight: '14px',
+                display: 'inline-block',
+              }}>
+                {pendingApprovals > 99 ? '99+' : pendingApprovals}
+              </span>
+            )}
             {tab.id === 'advisories' && unread > 0 && (
               <span style={{
                 background: C.red,
@@ -1245,7 +1586,7 @@ function TabBar({ activeTab, onSwitch, unread }) {
 
 // ── Header ────────────────────────────────────────────────────────────────────
 
-function Header({ wsStatus }) {
+function Header({ wsStatus, paused, onTogglePause }) {
   const dotColor = { connected: C.green, disconnected: C.red, connecting: C.amber }[wsStatus] || C.muted;
   const pulse    = wsStatus === 'connected';
 
@@ -1256,8 +1597,8 @@ function Header({ wsStatus }) {
       justifyContent: 'space-between',
       padding: '0 24px',
       height: 54,
-      background: C.surface,
-      borderBottom: `1px solid ${C.border}`,
+      background: paused ? 'rgba(255,68,85,0.06)' : C.surface,
+      borderBottom: `1px solid ${paused ? C.red + '44' : C.border}`,
       position: 'sticky',
       top: 0,
       zIndex: 100,
@@ -1274,8 +1615,34 @@ function Header({ wsStatus }) {
         <span style={{ fontSize: '0.72rem', color: C.muted, letterSpacing: '0.08em' }}>
           SECURITY OPERATIONS
         </span>
+        {paused && (
+          <span style={{
+            fontSize: '0.65rem', fontWeight: 700, color: C.red,
+            letterSpacing: '0.12em', padding: '2px 8px',
+            background: 'rgba(255,68,85,0.14)', borderRadius: 3,
+            border: `1px solid ${C.red}44`,
+          }}>
+            PAUSED
+          </span>
+        )}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <button
+          onClick={onTogglePause}
+          style={{
+            background: paused ? 'rgba(52,211,153,0.15)' : 'rgba(255,68,85,0.10)',
+            border: `1px solid ${paused ? C.green + '55' : C.red + '44'}`,
+            color: paused ? C.green : C.red,
+            fontSize: 10,
+            fontWeight: 700,
+            padding: '4px 12px',
+            borderRadius: 3,
+            cursor: 'pointer',
+            letterSpacing: '0.06em',
+          }}
+        >
+          {paused ? 'RESUME' : 'PAUSE'}
+        </button>
         <span style={{
           width: 8,
           height: 8,
@@ -1307,12 +1674,24 @@ export default function App() {
   const [newInbIds,  setNewInbIds]  = useState(new Set());
   const [stats,      setStats]      = useState(null);
   const [stages,     setStages]     = useState({});       // event_id → stage
+  const [paused,     setPaused]     = useState(false);
+  const [approvals,  setApprovals]  = useState([]);
+  const [config,     setConfig]     = useState([]);
+  const [budget,     setBudget]     = useState(null);
 
   const wsRef        = useRef(null);
   const retryRef     = useRef(null);
   const activeTabRef = useRef(activeTab);
 
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+  // Fetch initial HITL state
+  useEffect(() => {
+    fetch('/api/admin/status').then(r => r.json()).then(d => setPaused(d.paused)).catch(() => {});
+    fetch('/api/approvals?status=pending').then(r => r.json()).then(d => { if (Array.isArray(d)) setApprovals(d); }).catch(() => {});
+    fetch('/api/config').then(r => r.json()).then(d => { if (Array.isArray(d)) setConfig(d); }).catch(() => {});
+    fetch('/api/budget').then(r => r.json()).then(d => setBudget(d)).catch(() => {});
+  }, []);
 
   // Flash a uid in a Set for FLASH_MS then clear it
   const flash = useCallback((setter, id) => {
@@ -1370,6 +1749,15 @@ export default function App() {
         // Bulk stage catchup on reconnect
         setStages(prev => ({ ...prev, ...msg.payload }));
 
+      } else if (msg.type === 'system_status') {
+        setPaused(msg.payload.paused);
+
+      } else if (msg.type === 'approval_request') {
+        setApprovals(prev => [msg.payload, ...prev]);
+
+      } else if (msg.type === 'config_update') {
+        setConfig(prev => prev.map(c => c.key === msg.payload.key ? { ...c, value: msg.payload.value } : c));
+
       } else if (msg.type === 'advisory') {
         const adv = { ...msg.payload, ts: msg.ts, _uid: uid() };
         setAdvisories(prev => {
@@ -1400,10 +1788,53 @@ export default function App() {
     if (tab === 'advisories') setUnread(0);
   };
 
+  const togglePause = async () => {
+    const endpoint = paused ? '/api/admin/resume' : '/api/admin/pause';
+    try {
+      const res = await fetch(endpoint, { method: 'POST' });
+      const data = await res.json();
+      setPaused(data.paused);
+    } catch { /* ignore */ }
+  };
+
+  const handleApprovalDecision = async (approvalId, action) => {
+    try {
+      await fetch(`/api/approvals/${approvalId}/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decided_by: 'dashboard_analyst' }),
+      });
+      setApprovals(prev => prev.filter(a => a.id !== approvalId));
+    } catch { /* ignore */ }
+  };
+
+  const handleConfigSave = async (key, value) => {
+    try {
+      const res = await fetch(`/api/config/${key}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      });
+      const data = await res.json();
+      setConfig(prev => prev.map(c => c.key === key ? { ...c, value: data.value } : c));
+    } catch { /* ignore */ }
+  };
+
+  const handleBudgetSave = async (limit) => {
+    try {
+      await fetch('/api/budget/limit', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limit }),
+      });
+      setBudget(prev => prev ? { ...prev, limit } : { used: 0, limit, date: '' });
+    } catch { /* ignore */ }
+  };
+
   return (
     <div style={{ minHeight: '100vh', background: C.bg }}>
-      <Header wsStatus={wsStatus} />
-      <TabBar activeTab={activeTab} onSwitch={handleTabSwitch} unread={unread} />
+      <Header wsStatus={wsStatus} paused={paused} onTogglePause={togglePause} />
+      <TabBar activeTab={activeTab} onSwitch={handleTabSwitch} unread={unread} pendingApprovals={approvals.length} />
       <StatBar stats={stats} advisoryCount={advisories.length} />
 
       <div style={{ padding: '16px 24px', maxWidth: 1600, margin: '0 auto' }}>
@@ -1416,8 +1847,21 @@ export default function App() {
         {activeTab === 'advisories' && (
           <AdvisoriesView advisories={advisories} newIds={newAdvIds} />
         )}
+        {activeTab === 'approvals' && (
+          <ApprovalsView approvals={approvals} onDecision={handleApprovalDecision} />
+        )}
         {activeTab === 'attack' && (
           <AttackMatrix wsRef={wsRef} />
+        )}
+        {activeTab === 'settings' && (
+          <SettingsView
+            config={config}
+            onConfigSave={handleConfigSave}
+            budget={budget}
+            onBudgetSave={handleBudgetSave}
+            paused={paused}
+            onTogglePause={togglePause}
+          />
         )}
       </div>
     </div>

@@ -343,7 +343,11 @@ async def persist(
     messages overwrite rather than duplicate.
     """
     if state.get("skip"):
-        return {"advisory_id": None, "persist_error": None}
+        return {"advisory_id": None, "persist_error": None, "needs_approval": False, "approval_status": "auto_approved"}
+
+    # Determine if this advisory needs human approval (P1/P2 events)
+    priority = state.get("priority", "P3")
+    needs_approval = priority in ("P1", "P2")
 
     # Fetch simulation finding from Redis before it expires
     event_id = state.get("event_id", "")
@@ -430,19 +434,25 @@ async def persist(
             )
 
         advisory_id = row["id"] if row else None
+        approval_status = "pending" if needs_approval else "auto_approved"
         logger.info(
-            "Persisted advisory %s for event %s  (cve=%s, risk=%d)",
+            "Persisted advisory %s for event %s  (cve=%s, risk=%d, approval=%s)",
             advisory_id, state.get("event_id"), state.get("cve_id"),
-            state.get("risk_score", 0),
+            state.get("risk_score", 0), approval_status,
         )
-        return {"advisory_id": advisory_id, "persist_error": None}
+        return {
+            "advisory_id": advisory_id,
+            "persist_error": None,
+            "needs_approval": needs_approval,
+            "approval_status": approval_status,
+        }
 
     except Exception as exc:
         logger.error(
             "DB persist failed for event %s: %s",
             state.get("event_id"), exc,
         )
-        return {"advisory_id": None, "persist_error": str(exc)}
+        return {"advisory_id": None, "persist_error": str(exc), "needs_approval": False, "approval_status": "auto_approved"}
 
 
 # ---------------------------------------------------------------------------
@@ -542,3 +552,72 @@ async def acknowledge(
         except Exception as exc:
             logger.warning("XACK failed for %s: %s", msg_id, exc)
     return {"acknowledged": True}
+
+
+# ---------------------------------------------------------------------------
+# Node 6: request_approval (P1/P2 advisories only)
+# ---------------------------------------------------------------------------
+
+async def request_approval(
+    state: AdvisoryState,
+    *,
+    pool: asyncpg.Pool,
+    redis: aioredis.Redis,
+) -> dict[str, Any]:
+    """
+    Insert an approval request into the approval_queue table and notify
+    the dashboard via aegis:broadcast. The advisory is NOT broadcast to
+    the main feed until a human approves it.
+    """
+    advisory_id = state.get("advisory_id")
+    event_id    = state.get("event_id", "")
+    priority    = state.get("priority", "P3")
+    title       = state.get("title", "")
+
+    if not advisory_id:
+        logger.warning("No advisory_id for approval request — skipping.")
+        return {"approval_status": "auto_approved"}
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO approval_queue (advisory_id, event_id, priority, title, status)
+                VALUES ($1, $2, $3, $4, 'pending')
+                ON CONFLICT DO NOTHING
+                """,
+                advisory_id, event_id, priority, title,
+            )
+            # Update advisory record
+            await conn.execute(
+                "UPDATE advisories SET approval_status = 'pending' WHERE id = $1::uuid",
+                advisory_id,
+            )
+
+        # Notify dashboard
+        await redis.publish(BROADCAST_CHANNEL, json.dumps({
+            "type": "approval_request",
+            "advisory_id": advisory_id,
+            "event_id": event_id,
+            "priority": priority,
+            "title": title,
+        }))
+
+        # Publish stage update
+        if event_id:
+            await redis.hset("aegis:event:stages", event_id, "pending_approval")
+            await redis.publish(BROADCAST_CHANNEL, json.dumps({
+                "type": "stage_update",
+                "event_id": event_id,
+                "stage": "pending_approval",
+            }))
+
+        logger.info(
+            "Approval requested for advisory %s (event=%s, priority=%s)",
+            advisory_id, event_id, priority,
+        )
+        return {"approval_status": "pending"}
+
+    except Exception as exc:
+        logger.error("Approval request failed for %s: %s", advisory_id, exc)
+        return {"approval_status": "auto_approved"}

@@ -16,6 +16,7 @@ import logging
 import pathlib
 import signal
 import sys
+from datetime import date
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -120,6 +121,14 @@ async def consume(
     )
 
     while not shutdown.is_set():
+        # ── Kill Switch: pause check ─────────────────────────────────────
+        try:
+            if await redis.get("aegis:system:paused") == b"true":
+                await asyncio.sleep(2)
+                continue
+        except Exception:
+            pass
+
         # ── Reclaim stale pending messages ──────────────────────────────
         try:
             _next, claimed, *_ = await redis.xautoclaim(
@@ -167,8 +176,33 @@ async def consume(
                 "raw_fields": _decode_fields(raw_fields),
             }
 
+            # ── Budget enforcement ────────────────────────────────────────
+            budget_key = f"aegis:sim:budget:{date.today().isoformat()}"
+            try:
+                current = await redis.get(budget_key)
+                daily_limit = int(await redis.get("aegis:sim:daily_limit") or 50)
+                if current and int(current) >= daily_limit:
+                    logger.warning(
+                        "Daily simulation budget exhausted (%s/%s) — skipping %s",
+                        current, daily_limit, msg_id,
+                    )
+                    await redis.xack(
+                        SIMULATION_QUEUE, CONSUMER_GROUP, msg_id,
+                    )
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+
             try:
                 await graph.ainvoke(initial_state)
+                # Increment budget counter after successful simulation
+                try:
+                    pipe = redis.pipeline()
+                    pipe.incr(budget_key)
+                    pipe.expire(budget_key, 90_000)  # ~25h TTL
+                    await pipe.execute()
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "Graph execution error for message %s: %s", msg_id, exc

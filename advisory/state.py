@@ -68,8 +68,10 @@ class AdvisoryState(TypedDict, total=False):
     ext_references:     list[str]
 
     # ── After persist ─────────────────────────────────────────────────────────
-    advisory_id:   Optional[str]   # UUID from DB
-    persist_error: Optional[str]
+    advisory_id:      Optional[str]   # UUID from DB
+    persist_error:    Optional[str]
+    needs_approval:   bool            # True for P1/P2 → queued for human review
+    approval_status:  str             # "auto_approved" | "pending" | "approved" | "rejected"
 
     # ── After broadcast ───────────────────────────────────────────────────────
     broadcast_ok: bool

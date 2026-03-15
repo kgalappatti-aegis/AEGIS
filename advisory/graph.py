@@ -15,14 +15,18 @@ Topology:
                 ▼
             persist
                 │
-                ▼
-           broadcast
+                ├── needs_approval=True ──► request_approval ──► acknowledge
                 │
-                ▼
-          acknowledge
-                │
-                ▼
-               END
+                └── needs_approval=False
+                        │
+                        ▼
+                   broadcast
+                        │
+                        ▼
+                  acknowledge
+                        │
+                        ▼
+                       END
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from nodes import (
     generate_advisory,
     load_event,
     persist,
+    request_approval,
 )
 from state import AdvisoryState
 
@@ -53,6 +58,12 @@ def _after_load_event(
     state: AdvisoryState,
 ) -> Literal["generate_advisory", "acknowledge"]:
     return "acknowledge" if state.get("skip") else "generate_advisory"
+
+
+def _after_persist(
+    state: AdvisoryState,
+) -> Literal["request_approval", "broadcast"]:
+    return "request_approval" if state.get("needs_approval") else "broadcast"
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +85,7 @@ def build_graph(
     _persist   = functools.partial(persist,           pool=db_pool, redis=redis_client)
     _broadcast = functools.partial(broadcast,         redis=redis_client)
     _ack       = functools.partial(acknowledge,       redis=redis_client)
+    _approval  = functools.partial(request_approval,  pool=db_pool, redis=redis_client)
 
     graph = StateGraph(AdvisoryState)
 
@@ -81,6 +93,7 @@ def build_graph(
     graph.add_node("generate_advisory", _generate)
     graph.add_node("persist",           _persist)
     graph.add_node("broadcast",         _broadcast)
+    graph.add_node("request_approval",  _approval)
     graph.add_node("acknowledge",       _ack)
 
     graph.add_edge(START, "load_event")
@@ -95,7 +108,17 @@ def build_graph(
     )
 
     graph.add_edge("generate_advisory", "persist")
-    graph.add_edge("persist",           "broadcast")
+
+    graph.add_conditional_edges(
+        "persist",
+        _after_persist,
+        {
+            "request_approval": "request_approval",
+            "broadcast":        "broadcast",
+        },
+    )
+
+    graph.add_edge("request_approval",  "acknowledge")
     graph.add_edge("broadcast",         "acknowledge")
     graph.add_edge("acknowledge",       END)
 

@@ -133,6 +133,14 @@ async def consume(redis: aioredis.Redis, shutdown: asyncio.Event) -> None:
     )
 
     while not shutdown.is_set():
+        # ── Kill Switch: pause check ─────────────────────────────────────
+        try:
+            if await redis.get("aegis:system:paused") == b"true":
+                await asyncio.sleep(2)
+                continue
+        except Exception:
+            pass
+
         # --- 1. Reclaim stale pending messages from dead consumers ----------
         try:
             _next_id, claimed, *_ = await redis.xautoclaim(
